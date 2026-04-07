@@ -499,6 +499,10 @@ function renderMessages(){
       thinkingText=content.filter(p=>p&&(p.type==='thinking'||p.type==='reasoning')).map(p=>p.thinking||p.reasoning||p.text||'').join('\n');
       content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
     }
+    // Also check top-level reasoning field (Hermes format)
+    if(!thinkingText && m.reasoning){
+      thinkingText=m.reasoning;
+    }
     const isUser=m.role==='user';
     const isLastAssistant=!isUser&&vi===visWithIdx.length-1;
     // Render thinking card before the assistant message (collapsed by default)
