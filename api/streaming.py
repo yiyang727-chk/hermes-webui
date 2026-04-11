@@ -11,11 +11,12 @@ import traceback
 from pathlib import Path
 
 from api.config import (
-    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, CLI_TOOLSETS,
+    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, CLI_TOOLSETS,
     LOCK, SESSIONS, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     resolve_model_provider,
 )
+from api.helpers import redact_session_data
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
@@ -28,6 +29,23 @@ try:
     from run_agent import AIAgent
 except ImportError:
     AIAgent = None
+
+def _get_ai_agent():
+    """Return AIAgent class, retrying the import if the initial attempt failed.
+
+    auto_install_agent_deps() in server.py may install missing packages after
+    this module is first imported (common in Docker with a volume-mounted agent).
+    Re-attempting the import here picks up the newly installed packages without
+    requiring a server restart.
+    """
+    global AIAgent
+    if AIAgent is None:
+        try:
+            from run_agent import AIAgent as _cls  # noqa: PLC0415
+            AIAgent = _cls
+        except ImportError:
+            pass
+    return AIAgent
 from api.models import get_session, title_from
 from api.workspace import set_last_workspace
 
@@ -111,15 +129,15 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         # The finally block re-acquires to restore — keeping critical sections short
         # and preventing a deadlock where the restore would re-enter the same lock.
         with _ENV_LOCK:
-          old_cwd = os.environ.get('TERMINAL_CWD')
-          old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
-          old_session_key = os.environ.get('HERMES_SESSION_KEY')
-          old_hermes_home = os.environ.get('HERMES_HOME')
-          os.environ['TERMINAL_CWD'] = str(s.workspace)
-          os.environ['HERMES_EXEC_ASK'] = '1'
-          os.environ['HERMES_SESSION_KEY'] = session_id
-          if _profile_home:
-              os.environ['HERMES_HOME'] = _profile_home
+            old_cwd = os.environ.get('TERMINAL_CWD')
+            old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
+            old_session_key = os.environ.get('HERMES_SESSION_KEY')
+            old_hermes_home = os.environ.get('HERMES_HOME')
+            os.environ['TERMINAL_CWD'] = str(s.workspace)
+            os.environ['HERMES_EXEC_ASK'] = '1'
+            os.environ['HERMES_SESSION_KEY'] = session_id
+            if _profile_home:
+                os.environ['HERMES_HOME'] = _profile_home
         # Lock released — agent runs without holding it
         # Register a gateway-style notify callback so the approval system can
         # push the `approval` SSE event the moment a dangerous command is
@@ -165,7 +183,8 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 except ImportError:
                     pass
 
-            if AIAgent is None:
+            _AIAgent = _get_ai_agent()
+            if _AIAgent is None:
                 raise ImportError("AIAgent not available -- check that hermes-agent is on sys.path")
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model)
 
@@ -206,7 +225,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             else:
                 _fallback_resolved = None
 
-            agent = AIAgent(
+            agent = _AIAgent(
                 model=resolved_model,
                 provider=resolved_provider,
                 base_url=resolved_base_url,
@@ -219,6 +238,20 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 stream_delta_callback=on_token,
                 tool_progress_callback=on_tool,
             )
+
+            # Store agent instance for cancel/interrupt propagation
+            with STREAMS_LOCK:
+                AGENT_INSTANCES[stream_id] = agent
+                # Check if cancel was requested during agent initialization
+                if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
+                    # Cancel arrived during agent creation - interrupt immediately
+                    try:
+                        agent.interrupt("Cancelled before start")
+                    except Exception:
+                        pass
+                    put('cancel', {'message': 'Cancelled by user'})
+                    return
+
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
             workspace_ctx = f"[Workspace: {s.workspace}]\n"
@@ -404,7 +437,8 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 usage['context_length'] = getattr(_cc, 'context_length', 0) or 0
                 usage['threshold_tokens'] = getattr(_cc, 'threshold_tokens', 0) or 0
                 usage['last_prompt_tokens'] = getattr(_cc, 'last_prompt_tokens', 0) or 0
-            put('done', {'session': s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}, 'usage': usage})
+            raw_session = s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}
+            put('done', {'session': redact_session_data(raw_session), 'usage': usage})
         finally:
             # Unregister the gateway approval callback and unblock any threads
             # still waiting on approval (e.g. stream cancelled mid-approval).
@@ -442,6 +476,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)
+            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
 
 # ============================================================
 # SECTION: HTTP Request Handler
@@ -456,9 +491,31 @@ def cancel_stream(stream_id: str) -> bool:
     with STREAMS_LOCK:
         if stream_id not in STREAMS:
             return False
+
+        # Set WebUI layer cancel flag
         flag = CANCEL_FLAGS.get(stream_id)
         if flag:
             flag.set()
+
+        # Interrupt the AIAgent instance to stop tool execution
+        agent = AGENT_INSTANCES.get(stream_id)
+        if agent:
+            try:
+                agent.interrupt("Cancelled by user")
+            except Exception as e:
+                # Log but don't block the cancel flow
+                import logging
+                logging.getLogger(__name__).debug(
+                    f"Failed to interrupt agent for stream {stream_id}: {e}"
+                )
+        else:
+            # Agent not yet stored - cancel_event flag will be checked by agent thread
+            import logging
+            logging.getLogger(__name__).debug(
+                f"Cancel requested for stream {stream_id} before agent ready - "
+                f"cancel_event flag set, will be checked on agent startup"
+            )
+
         # Put a cancel sentinel into the queue so the SSE handler wakes up
         q = STREAMS.get(stream_id)
         if q:
