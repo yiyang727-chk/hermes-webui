@@ -16,7 +16,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 from api.config import (
-    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, CLI_TOOLSETS,
+    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES,
     LOCK, SESSIONS, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     resolve_model_provider,
@@ -804,9 +804,10 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             from api.config import get_config as _get_config
             _cfg = _get_config()
 
-            # Per-profile toolsets (fall back to module-level CLI_TOOLSETS)
-            _pt = _cfg.get('platform_toolsets', {})
-            _toolsets = _pt.get('cli', CLI_TOOLSETS) if isinstance(_pt, dict) else CLI_TOOLSETS
+            # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
+            # server toolsets are included, matching native CLI behaviour.
+            from api.config import _resolve_cli_toolsets
+            _toolsets = _resolve_cli_toolsets(_cfg)
 
             # Fallback model from profile config (e.g. for rate-limit recovery)
             _fallback = _cfg.get('fallback_model') or None
