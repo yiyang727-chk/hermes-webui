@@ -851,6 +851,14 @@ def resolve_model_provider(model_id: str) -> tuple:
         # e.g. config=anthropic, model=anthropic/claude-... → bare name to anthropic API
         if config_provider and prefix == config_provider:
             return bare, config_provider, config_base_url
+        # Portal providers (Nous, OpenCode) serve models from multiple upstream
+        # namespaces — check them BEFORE the config_base_url branch so that a
+        # Nous user whose config.yaml also has a base_url doesn't accidentally
+        # fall into the prefix-stripping path (#894: minimax/minimax-m2.7 → bare
+        # name sent to Nous → 404 because Nous requires the full namespace path).
+        _PORTAL_PROVIDERS = {"nous", "opencode-zen", "opencode-go"}
+        if config_provider in _PORTAL_PROVIDERS:
+            return model_id, config_provider, config_base_url
         # If a custom endpoint base_url is configured, don't reroute through OpenRouter
         # just because the model name contains a slash (e.g. google/gemma-4-26b-a4b).
         # The user has explicitly pointed at a base_url, so trust their routing config.
@@ -862,20 +870,6 @@ def resolve_model_provider(model_id: str) -> tuple:
             if prefix in _PROVIDER_MODELS:
                 return bare, config_provider, config_base_url
             # Unknown prefix (not a named provider) — pass full model_id through.
-            return model_id, config_provider, config_base_url
-        # Portal providers (Nous, OpenCode) serve models from multiple upstream
-        # namespaces. When the active provider is a portal, trust it for cross-
-        # namespace models rather than rerouting to OpenRouter — the portal
-        # handles the upstream routing itself.  Preserve the full slash-prefixed
-        # model ID: portals use the provider/model path as the canonical name
-        # at their /chat/completions endpoint (e.g. Nous rejects a bare
-        # "claude-opus-4.6" — it needs "anthropic/claude-opus-4.6" to route
-        # upstream). This keeps the static-dropdown path consistent with the
-        # live-fetched path (`@nous:anthropic/claude-opus-4.6`), which also
-        # preserves the slash via the split-at-first-colon in the @-prefix
-        # branch above.
-        _PORTAL_PROVIDERS = {"nous", "opencode-zen", "opencode-go"}
-        if config_provider in _PORTAL_PROVIDERS:
             return model_id, config_provider, config_base_url
 
         # If prefix does NOT match config provider, the user picked a cross-provider model
@@ -1021,6 +1015,15 @@ def set_hermes_default_model(model_id: str) -> dict:
         resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
             selected_model
         )
+        # Persist the resolved bare/slash form, NOT the `@provider:` prefix. The
+        # prefix is a WebUI-internal routing hint that the hermes-agent CLI does
+        # not understand — if we wrote `@nous:anthropic/claude-opus-4.6` to
+        # config.yaml, a user who ran `hermes` in the terminal right after
+        # saving via WebUI would have the agent send that literal string to the
+        # Nous API, which would reject it (Nous expects `anthropic/claude-opus-4.6`,
+        # not the prefixed form). The Settings picker handles the resulting
+        # CLI-shaped bare form via `_applyModelToDropdown()`'s normalising
+        # matcher — see `static/panels.js` (#895).
         persisted_model = str(resolved_model or selected_model).strip()
         persisted_provider = str(resolved_provider or previous_provider or "").strip()
 
@@ -1040,11 +1043,12 @@ def set_hermes_default_model(model_id: str) -> dict:
         _save_yaml_config_file(config_path, config_data)
     # Reload outside the lock — reload_config() acquires _cfg_lock itself.
     reload_config()
-    # reload_config() resyncs _cfg_mtime to the new file mtime, so the mtime
-    # check inside get_available_models() won't trigger invalidation. Drop
-    # the TTL cache explicitly so the next call recomputes with the new model.
+    # Invalidate the TTL cache so the next /api/models call returns fresh data
+    # with the new default model. Do NOT call get_available_models() here —
+    # it triggers a live provider fetch (up to 8s) that blocks the HTTP response
+    # to the browser, causing a visible freeze on every Settings save (#895).
     invalidate_models_cache()
-    return get_available_models()
+    return {"ok": True, "model": persisted_model}
 
 
 # ── TTL cache for get_available_models() ─────────────────────────────────────
