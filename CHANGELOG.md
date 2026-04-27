@@ -3,12 +3,24 @@
 ## [Unreleased]
 
 ### Fixed
+- **Auto-title generic fallback** — when the auxiliary title-generation call
+  fails and the local fallback can only produce the generic label
+  `Conversation topic`, the WebUI now keeps the existing provisional title
+  instead of persisting the generic placeholder as a generated title. The
+  `title_status` diagnostic still preserves the underlying LLM failure reason.
+  (`api/streaming.py`, `tests/test_title_aux_routing.py`) Closes #1155.
 - **Recurring cron jobs with no next run need attention** — the Tasks panel now
   distinguishes anomalous recurring jobs (`enabled=false`, `state=completed`,
   `next_run_at=null`) from ordinary off jobs, shows a warning with recovery
   actions, and lets users copy diagnostics for scheduler/runtime failures.
   (`static/panels.js`, `static/style.css`, `static/i18n.js`,
   `tests/test_cron_needs_attention.py`)
+- **Auto-compression notification uses compression cards** — automatic context
+  compression now renders as a transient compression card in the transcript
+  instead of adding an italic fake assistant message, and preserved task-list
+  snapshots appended by Hermes Agent render as compression sub-cards instead of
+  ordinary user bubbles. (`static/messages.js`, `static/ui.js`,
+  `static/i18n.js`)
 - **Legacy `@provider:model` session models** — persisted sessions with an
   old explicit provider hint (for example `@copilot:gpt-5.5`) now pass through
   the same stale-model compatibility recovery as slash-prefixed session models,
@@ -344,6 +356,54 @@
   limited to trusted roots (home, saved workspaces, and the boot default
   workspace subtree) and never enumerate blocked system roots. (`api/routes.py`,
   `api/workspace.py`, `static/panels.js`, `static/style.css`) (partial for #616)
+
+## [v0.50.227] — 2026-04-27
+
+### Fixed
+- **Korean locale label and missing Settings descriptions** — `ko._label` normalized to
+  `'한국어'`; ten Settings pane description keys that were falling back to English are
+  now fully translated. (`static/i18n.js`) (#1138)
+- **Workspace trust: alternative home roots** — `resolve_trusted_workspace()` now checks
+  the home-directory allowance before the blocked-roots loop, letting symlinked home paths
+  (e.g. `/var/home/user`) pass through correctly. (`api/workspace.py`) (#1165)
+- **Custom config-file provider models** — the provider-discovery loop now includes entries
+  defined under `providers:` in `config.yaml`, so custom providers no longer silently skip
+  the model list. Shared `_PROVIDER_MODELS` list is deep-copied before mutation to prevent
+  cross-session bleed. (`api/config.py`) (#1161)
+- **Save Settings button missing from System pane** — the System settings pane now has a
+  Save Settings button so password changes and other system fields can actually be
+  submitted. (`static/index.html`) (#1146)
+- **Per-job cron completion dot** — the Tasks panel now shows a pulsing green dot on each
+  cron job that has a new unread completion; the dot clears only when that specific job's
+  detail view is opened, not on any panel-level navigation. (`static/panels.js`,
+  `static/style.css`) (#1145)
+- **Hide cron agent sessions from sidebar by default** — sessions created by the cron
+  scheduler (source `cron` or session_id prefix `cron_`) are now filtered out of the
+  default session list in both the index path and the full-scan path; imported gateway
+  cron sessions are also hidden via `read_importable_agent_session_rows()`.
+  (`api/models.py`, `api/agent_sessions.py`) (#1143)
+- **Symlink cycle detection in workspace file browser** — intentional symlinks within the
+  workspace root are now allowed; only self-referencing or ancestor-pointing symlinks are
+  blocked. Symlink entries render with type, target, and `is_dir`. (`api/workspace.py`)
+  (#1149)
+- **`/status` command enriched** — output now includes session id, profile, model+provider,
+  workspace, personality, start time, per-turn token counts, estimated cost, and agent
+  running state. i18n keys added for all locales. (`api/session_ops.py`,
+  `static/commands.js`, `static/i18n.js`) (#1156)
+- **Per-turn cost display on assistant bubbles** — each assistant message footer now shows
+  the token delta and estimated cost for that turn, computed from the cumulative `done` SSE
+  usage minus the previous turn's total. (`static/messages.js`, `static/ui.js`) (#1159)
+- **Auto-title: skip generic fallback** — when auxiliary title generation fails and the
+  local fallback would only produce `"Conversation topic"`, the existing provisional title
+  is kept instead of persisting the generic placeholder. (`api/streaming.py`) (#1157)
+- **Sidebar session rename first-Enter revert** — double-click inline rename now keeps the
+  new title after the first Enter keypress; `finish()` is idempotent via a guard flag and
+  `_renamingSid` stays locked until the full async path (success, failure, or cancel)
+  completes. (`static/sessions.js`) (#1162)
+- **Auto-compression renders as transient card** — automatic context compression now
+  renders as a collapsible compression card instead of injecting a fake `*[Context was
+  auto-compressed]*` assistant message; preserved task-list user messages also render as
+  sub-cards. (`static/messages.js`, `static/ui.js`, `static/i18n.js`) (#1142)
 
 ## [v0.50.226] — 2026-04-27
 

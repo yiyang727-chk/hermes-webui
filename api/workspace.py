@@ -385,6 +385,19 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
     if not candidate.is_dir():
         raise ValueError(f"Path is not a directory: {candidate}")
 
+    # (A) Trusted if under the user's home directory — cross-platform via Path.home()
+    # Must be checked before system roots to allow symlinks like /var/home.
+    # Guard: skip if HOME is / or is itself a blocked root (unusual container setups).
+    _home = Path.home().resolve()
+    _home_is_sane = (_home != Path("/") and
+                     not any(_is_within(_home, b) for b in _workspace_blocked_roots()))
+    if _home_is_sane:
+        try:
+            candidate.relative_to(_home)
+            return candidate
+        except ValueError:
+            pass
+
     # Block known system roots and their children
     for blocked in _workspace_blocked_roots():
         try:
@@ -394,13 +407,6 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
             if "system directory" in str(e):
                 raise
             # relative_to raised ValueError = candidate is NOT under blocked = safe
-
-    # (A) Trusted if under the user's home directory — cross-platform via Path.home()
-    try:
-        candidate.relative_to(Path.home().resolve())
-        return candidate
-    except ValueError:
-        pass
 
     # (B) Trusted if already in the saved workspace list — covers non-home installs
     try:
@@ -461,9 +467,39 @@ def validate_workspace_to_add(path: str) -> Path:
     return candidate
 
 def safe_resolve_ws(root: Path, requested: str) -> Path:
-    """Resolve a relative path inside a workspace root, raising ValueError on traversal."""
-    resolved = (root / requested).resolve()
-    resolved.relative_to(root.resolve())
+    """Resolve a relative path inside a workspace root, raising ValueError on traversal.
+
+    Symlinks whose *unresolved* path is within the workspace root are allowed —
+    the user placed them there intentionally.  Only raw ``..`` traversal outside
+    the root is blocked.
+    """
+    import os
+    unresolved = root / requested
+    resolved = unresolved.resolve()
+    # Fast path: resolved path is inside root (covers most cases)
+    try:
+        resolved.relative_to(root.resolve())
+        return resolved
+    except ValueError:
+        pass
+    # Symlink path: normalize '..' (without following symlinks) and check
+    # os.path.normpath collapses '..' but does NOT follow symlinks.
+    norm = Path(os.path.normpath(str(unresolved)))
+    try:
+        norm.relative_to(root)
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {requested}")
+    # Symlink points outside workspace root — additionally block system directories.
+    # Even if the user placed the symlink intentionally, prevent reads from
+    # /etc, /proc, /sys, /dev and other blocked roots (LLM agents can call
+    # read_file_content via tool calls, not just human users).
+    for blocked in _workspace_blocked_roots():
+        try:
+            resolved.relative_to(blocked)
+            raise ValueError(f"Path traversal blocked (system dir): {requested}")
+        except ValueError as _e:
+            if "system dir" in str(_e):
+                raise
     return resolved
 
 
@@ -471,14 +507,68 @@ def list_dir(workspace: Path, rel: str='.'):
     target = safe_resolve_ws(workspace, rel)
     if not target.is_dir():
         raise FileNotFoundError(f"Not a directory: {rel}")
+    ws_resolved = workspace.resolve()
     entries = []
-    for item in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-        entries.append({
-            'name': item.name,
-            'path': str(item.relative_to(workspace)),
-            'type': 'dir' if item.is_dir() else 'file',
-            'size': item.stat().st_size if item.is_file() else None,
-        })
+    for item in sorted(target.iterdir(), key=lambda p: (not p.is_symlink(), p.is_file(), p.name.lower())):
+        if item.is_symlink():
+            # Resolve the symlink target and check if it stays within workspace
+            try:
+                link_target = item.resolve()
+            except OSError:
+                continue
+            # Cycle detection: skip if symlink points back to current dir,
+            # workspace root, or any ancestor of current dir.
+            # This must run REGARDLESS of whether target is inside workspace.
+            if (link_target == target.resolve() or link_target == target
+                    or link_target == ws_resolved):
+                continue
+            try:
+                target.resolve().relative_to(link_target)
+                # target is under link_target — link_target is an ancestor → cycle
+                continue
+            except ValueError:
+                pass
+            # Block symlinks that resolve to system directories.
+            _sym_blocked = False
+            for _blocked in _workspace_blocked_roots():
+                try:
+                    link_target.relative_to(_blocked)
+                    _sym_blocked = True
+                    break
+                except ValueError:
+                    pass
+            if _sym_blocked:
+                continue
+            is_dir = link_target.is_dir()
+            # Keep the display path relative to workspace (don't follow the link)
+            display_path = str(Path(item.name))
+            if rel and rel != '.':
+                display_path = rel + '/' + display_path
+            entry = {
+                'name': item.name,
+                'path': display_path,
+                'type': 'symlink',
+                'target': str(link_target),
+                'is_dir': is_dir,
+            }
+            if not is_dir:
+                try:
+                    entry['size'] = link_target.stat().st_size
+                except OSError:
+                    entry['size'] = None
+            entries.append(entry)
+        else:
+            # Use rel-based path so entries under symlink targets (outside
+            # the workspace root) still get a valid workspace-relative path.
+            entry_path = item.name
+            if rel and rel != '.':
+                entry_path = rel + '/' + item.name
+            entries.append({
+                'name': item.name,
+                'path': entry_path,
+                'type': 'dir' if item.is_dir() else 'file',
+                'size': item.stat().st_size if item.is_file() else None,
+            })
         if len(entries) >= 200:
             break
     return entries

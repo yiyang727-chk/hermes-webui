@@ -752,14 +752,47 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
       }
       if(S.session&&S.session.session_id===activeSid){
+        // Capture previous session totals BEFORE overwriting S.session with the new
+        // cumulative values from the done event. prevIn/prevOut are the totals as of
+        // the start of this turn; curIn/curOut are the full post-turn totals — the
+        // delta is the per-turn usage for #1159.
+        const _prevIn=(S.session&&S.session.input_tokens)||0;
+        const _prevOut=(S.session&&S.session.output_tokens)||0;
+        const _prevCost=(S.session&&S.session.estimated_cost)||0;
         S.session=d.session;S.messages=d.session.messages||[];
+        if(
+          window._compressionUi&&window._compressionUi.automatic&&
+          window._compressionUi.sessionId===activeSid&&
+          d.session&&d.session.session_id
+        ){
+          window._compressionUi={...window._compressionUi, sessionId:d.session.session_id};
+        }
         // Find the last assistant message once for both reasoning persistence and timestamp
         const lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
         // Persist reasoning trace so thinking card survives page reload
         if(reasoningText&&lastAsst&&!lastAsst.reasoning) lastAsst.reasoning=reasoningText;
         // Stamp _ts on the last assistant message if it has no timestamp
         if(lastAsst&&!lastAsst._ts&&!lastAsst.timestamp) lastAsst._ts=Date.now()/1000;
-        if(d.usage){S.lastUsage=d.usage;_syncCtxIndicator(d.usage);}
+        if(d.usage){
+          S.lastUsage=d.usage;_syncCtxIndicator(d.usage);
+          // #503 — compute per-turn cost delta and attach to last assistant message
+          if(lastAsst){
+            const prevIn=_prevIn;
+            const prevOut=_prevOut;
+            const prevCost=_prevCost;
+            const curIn=d.usage.input_tokens||0;
+            const curOut=d.usage.output_tokens||0;
+            const curCost=d.usage.estimated_cost||0;
+            // Only set delta if values actually increased (skip no-op turns)
+            if(curIn>prevIn||curOut>prevOut){
+              lastAsst._turnUsage={
+                input_tokens:Math.max(0,curIn-prevIn),
+                output_tokens:Math.max(0,curOut-prevOut),
+                estimated_cost:Math.max(0,curCost-prevCost),
+              };
+            }
+          }
+        }
         if(d.session.tool_calls&&d.session.tool_calls.length){
           S.toolCalls=d.session.tool_calls.map(tc=>({...tc,done:true}));
         } else {
@@ -814,14 +847,25 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('compressed',e=>{
-      // Context was auto-compressed during this turn -- show a system message
+      // Context was auto-compressed during this turn. Render it through the
+      // same transient compression-card path as manual /compress, without
+      // inserting a fake assistant message into history or model context.
       if(!S.session||S.session.session_id!==activeSid) return;
-      try{
-        const d=JSON.parse(e.data);
-        const sysMsg={role:'assistant',content:'*[Context was auto-compressed to continue the conversation]*'};
-        S.messages.push(sysMsg);
-        showToast(d.message||'Context compressed');
-      }catch(err){}
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      const message=String(d.message||'Context auto-compressed to continue the conversation').trim();
+      if(typeof setCompressionUi==='function'){
+        setCompressionUi({
+          sessionId:activeSid,
+          phase:'done',
+          automatic:true,
+          message,
+          summary:{headline:message},
+        });
+      }
+      if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+      if(!S.busy&&typeof renderMessages==='function') renderMessages();
+      showToast(message||'Context compressed');
     });
 
     source.addEventListener('metering',e=>{
