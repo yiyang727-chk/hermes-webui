@@ -204,9 +204,6 @@ async function send(){
     if(typeof renderSessionList === 'function') {
       void renderSessionList();
     }
-    // Show Cancel button
-    const cancelBtn=$('btnCancel');
-    if(cancelBtn) cancelBtn.style.display='inline-flex';
   }catch(e){
     const errMsg=String((e&&e.message)||'');
     const conflictActiveStream=/session already has an active stream/i.test(errMsg);
@@ -791,7 +788,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true);
       if(isActiveSession){
         S.activeStreamId=null;
-        const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
       }
       if(isActiveSession){
         // Capture previous session totals BEFORE overwriting S.session with the new
@@ -938,7 +934,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
       if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
       if(S.session&&S.session.session_id===activeSid){
-        S.activeStreamId=null;const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
+        S.activeStreamId=null;
         clearLiveToolCards();if(!assistantText)removeThinking();
         try{
           const d=JSON.parse(e.data);
@@ -1016,7 +1012,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
       if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
       if(S.session&&S.session.session_id===activeSid){
-        S.activeStreamId=null;const _cbc=$('btnCancel');if(_cbc)_cbc.style.display='none';
+        S.activeStreamId=null;
       }
       // Fetch latest session from server to get accurate message list (includes cancel status)
       // This ensures messages stay in sync with server, fixing race condition where local
@@ -1061,7 +1057,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _markSessionCompletionUnread(completedSid, session.message_count);
       }
       if(S.session&&S.session.session_id===activeSid){
-        S.activeStreamId=null;const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
+        S.activeStreamId=null;
         clearLiveToolCards();if(!assistantText)removeThinking();
         S.session=session;S.messages=(session.messages||[]).filter(m=>m&&m.role);
         const hasMessageToolMetadata=S.messages.some(m=>{
@@ -1097,7 +1093,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
     if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
     if(S.session&&S.session.session_id===activeSid){
-      S.activeStreamId=null;const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
+      S.activeStreamId=null;
       clearLiveToolCards();if(!assistantText)removeThinking();
       S.messages.push({role:'assistant',content:'**Error:** Connection lost'});renderMessages();
       _markSessionViewed(activeSid, S.messages.length);
@@ -1126,7 +1122,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
           if(S.session&&S.session.session_id===activeSid){
             S.activeStreamId=null;
-            const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
             clearLiveToolCards();
             removeThinking();
             _queueDrainSid=activeSid;setBusy(false);

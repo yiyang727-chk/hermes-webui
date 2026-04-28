@@ -294,7 +294,6 @@ async function newSession(flash){
   S.busy=false;
   S.activeStreamId=null;
   updateSendBtn();
-  const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
   setStatus('');
   setComposerStatus('');
   updateQueueBadge(S.session.session_id);
@@ -469,7 +468,6 @@ async function loadSession(sid){
       S.busy=false;
       S.activeStreamId=null;
       updateSendBtn();
-      const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
       setStatus('');
       setComposerStatus('');
       updateQueueBadge(sid);
