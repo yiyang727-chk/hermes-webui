@@ -11,7 +11,9 @@ import logging
 import os
 import secrets
 import tempfile
+import threading
 import time
+from pathlib import Path
 
 from api.config import STATE_DIR, load_settings
 
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ── Public paths (no auth required) ─────────────────────────────────────────
 PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico',
+    '/sw.js', '/manifest.json', '/manifest.webmanifest',
     '/api/auth/login', '/api/auth/status',
 })
 
@@ -27,9 +30,113 @@ COOKIE_NAME = 'hermes_session'
 SESSION_TTL = 86400  # 24 hours
 
 _SESSIONS_FILE = STATE_DIR / '.sessions.json'
+_tls = threading.local()
 
 
-def _load_sessions() -> dict[str, float]:
+def _normalize_profile_list(values) -> list[str]:
+    """Normalize a profile allowlist, preserving order and dropping invalid names."""
+    try:
+        from api.profiles import _PROFILE_ID_RE
+    except Exception:
+        _PROFILE_ID_RE = None
+    out = []
+    seen = set()
+    for raw in values or []:
+        name = str(raw or '').strip()
+        if not name:
+            continue
+        if name != 'default' and _PROFILE_ID_RE is not None and not _PROFILE_ID_RE.fullmatch(name):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _normalize_workspace_list(values) -> list[str]:
+    """Normalize a workspace allowlist to existing absolute paths."""
+    out = []
+    seen = set()
+    for raw in values or []:
+        text = str(raw or '').strip()
+        if not text:
+            continue
+        try:
+            normalized = str(Path(text).expanduser().resolve())
+        except Exception:
+            continue
+        if not Path(normalized).is_dir():
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _normalize_user_record(raw: dict) -> dict | None:
+    """Normalize one auth user record from settings.json."""
+    if not isinstance(raw, dict):
+        return None
+    username = str(raw.get('username') or '').strip().lower()
+    password_hash = str(raw.get('password_hash') or '').strip()
+    if not username or not password_hash:
+        return None
+    allowed_profiles = _normalize_profile_list(raw.get('allowed_profiles') or [])
+    if not allowed_profiles:
+        allowed_profiles = ['default']
+    default_profile = str(raw.get('default_profile') or '').strip()
+    if default_profile not in allowed_profiles:
+        default_profile = allowed_profiles[0]
+    allowed_workspaces = _normalize_workspace_list(raw.get('allowed_workspaces') or [])
+    default_workspace = str(raw.get('default_workspace') or '').strip()
+    if default_workspace:
+        normalized_default = _normalize_workspace_list([default_workspace])
+        default_workspace = normalized_default[0] if normalized_default else ''
+    if default_workspace and default_workspace not in allowed_workspaces:
+        allowed_workspaces.append(default_workspace)
+    if not default_workspace and allowed_workspaces:
+        default_workspace = allowed_workspaces[0]
+    return {
+        'username': username,
+        'password_hash': password_hash,
+        'allowed_profiles': allowed_profiles,
+        'default_profile': default_profile,
+        'allowed_workspaces': allowed_workspaces,
+        'default_workspace': default_workspace or None,
+        'is_admin': bool(raw.get('is_admin', False)),
+    }
+
+
+def get_auth_users() -> list[dict]:
+    """Return normalized account records from settings.json."""
+    settings = load_settings()
+    users = settings.get('auth_users')
+    if not isinstance(users, list):
+        return []
+    normalized = []
+    seen = set()
+    for user in users:
+        item = _normalize_user_record(user)
+        if not item or item['username'] in seen:
+            continue
+        seen.add(item['username'])
+        normalized.append(item)
+    return normalized
+
+
+def _find_auth_user(username: str | None) -> dict | None:
+    target = str(username or '').strip().lower()
+    if not target:
+        return None
+    for user in get_auth_users():
+        if user['username'] == target:
+            return user
+    return None
+
+
+def _load_sessions() -> dict[str, dict]:
     """Load persisted sessions from STATE_DIR, pruning expired entries.
 
     Returns an empty dict on any read or parse error so startup is never
@@ -41,14 +148,35 @@ def _load_sessions() -> dict[str, float]:
             if not isinstance(data, dict):
                 raise ValueError('malformed sessions file — expected dict')
             now = time.time()
-            return {t: exp for t, exp in data.items()
-                    if isinstance(t, str) and isinstance(exp, (int, float)) and exp > now}
+            normalized = {}
+            for token, value in data.items():
+                if not isinstance(token, str):
+                    continue
+                if isinstance(value, (int, float)):
+                    if value > now:
+                        normalized[token] = {'exp': float(value)}
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                exp = value.get('exp')
+                if not isinstance(exp, (int, float)) or exp <= now:
+                    continue
+                normalized[token] = {
+                    'exp': float(exp),
+                    'username': str(value.get('username') or '').strip().lower() or None,
+                    'allowed_profiles': _normalize_profile_list(value.get('allowed_profiles') or []),
+                    'default_profile': str(value.get('default_profile') or '').strip() or None,
+                    'allowed_workspaces': _normalize_workspace_list(value.get('allowed_workspaces') or []),
+                    'default_workspace': str(value.get('default_workspace') or '').strip() or None,
+                    'is_admin': bool(value.get('is_admin', False)),
+                }
+            return normalized
     except Exception as e:
         logger.debug("Failed to load sessions file, starting fresh: %s", e)
     return {}
 
 
-def _save_sessions(sessions: dict[str, float]) -> None:
+def _save_sessions(sessions: dict[str, dict]) -> None:
     """Atomically persist sessions to STATE_DIR/.sessions.json (0600).
 
     Uses a temp file + os.replace() so a crash mid-write never leaves a
@@ -139,8 +267,8 @@ def get_password_hash() -> str | None:
 
 
 def is_auth_enabled() -> bool:
-    """True if a password is configured (env var or settings)."""
-    return get_password_hash() is not None
+    """True if either legacy single-password auth or user auth is configured."""
+    return bool(get_auth_users()) or get_password_hash() is not None
 
 
 def verify_password(plain) -> bool:
@@ -151,10 +279,51 @@ def verify_password(plain) -> bool:
     return hmac.compare_digest(_hash_password(plain), expected)
 
 
-def create_session() -> str:
+def verify_login(username: str | None, password: str) -> dict | None:
+    """Verify credentials and return normalized identity metadata on success."""
+    users = get_auth_users()
+    if users:
+        user = _find_auth_user(username)
+        if not user:
+            return None
+        if not hmac.compare_digest(_hash_password(password or ''), user['password_hash']):
+            return None
+        return {
+            'username': user['username'],
+            'allowed_profiles': list(user['allowed_profiles']),
+            'default_profile': user['default_profile'],
+            'allowed_workspaces': list(user.get('allowed_workspaces') or []),
+            'default_workspace': user.get('default_workspace'),
+            'is_admin': bool(user['is_admin']),
+        }
+    if verify_password(password):
+        return {
+            'username': None,
+            'allowed_profiles': [],
+            'default_profile': 'default',
+            'allowed_workspaces': [],
+            'default_workspace': None,
+            'is_admin': True,
+        }
+    return None
+
+
+def create_session(identity: dict | None = None) -> str:
     """Create a new auth session. Returns signed cookie value."""
     token = secrets.token_hex(32)
-    _sessions[token] = time.time() + SESSION_TTL
+    identity = identity or {}
+    if any(identity.get(k) for k in ('username', 'allowed_profiles', 'default_profile', 'allowed_workspaces', 'default_workspace')) or identity.get('is_admin'):
+        _sessions[token] = {
+            'exp': time.time() + SESSION_TTL,
+            'username': str(identity.get('username') or '').strip().lower() or None,
+            'allowed_profiles': _normalize_profile_list(identity.get('allowed_profiles') or []),
+            'default_profile': str(identity.get('default_profile') or '').strip() or None,
+            'allowed_workspaces': _normalize_workspace_list(identity.get('allowed_workspaces') or []),
+            'default_workspace': str(identity.get('default_workspace') or '').strip() or None,
+            'is_admin': bool(identity.get('is_admin', False)),
+        }
+    else:
+        _sessions[token] = time.time() + SESSION_TTL
     _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()[:32]
     return f"{token}.{sig}"
@@ -163,27 +332,70 @@ def create_session() -> str:
 def _prune_expired_sessions():
     """Remove all expired session entries to prevent unbounded memory growth."""
     now = time.time()
-    expired = [t for t, exp in _sessions.items() if now > exp]
+    expired = []
+    for token, meta in _sessions.items():
+        if isinstance(meta, (int, float)):
+            if now > float(meta):
+                expired.append(token)
+            continue
+        if now > float((meta or {}).get('exp', 0)):
+            expired.append(token)
     if expired:
         for token in expired:
             _sessions.pop(token, None)
         _save_sessions(_sessions)
 
 
-def verify_session(cookie_value) -> bool:
-    """Verify a signed session cookie. Returns True if valid and not expired."""
+def get_session_record(cookie_value) -> dict | None:
+    """Return the normalized session metadata for a signed cookie, or None."""
     if not cookie_value or '.' not in cookie_value:
-        return False
-    _prune_expired_sessions()  # lazy cleanup on every verification attempt
+        return None
+    _prune_expired_sessions()
     token, sig = cookie_value.rsplit('.', 1)
     expected_sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(sig, expected_sig):
-        return False
-    expiry = _sessions.get(token)
-    if not expiry or time.time() > expiry:
+        return None
+    entry = _sessions.get(token)
+    if isinstance(entry, (int, float)):
+        if time.time() > float(entry):
+            _sessions.pop(token, None)
+            return None
+        return {
+            'token': token,
+            'exp': float(entry),
+            'username': None,
+            'allowed_profiles': [],
+            'default_profile': 'default',
+            'allowed_workspaces': [],
+            'default_workspace': None,
+            'is_admin': True,
+        }
+    if not isinstance(entry, dict):
+        return None
+    exp = entry.get('exp')
+    if not isinstance(exp, (int, float)) or time.time() > exp:
         _sessions.pop(token, None)
-        return False
-    return True
+        return None
+    allowed_profiles = _normalize_profile_list(entry.get('allowed_profiles') or [])
+    default_profile = str(entry.get('default_profile') or '').strip() or (allowed_profiles[0] if allowed_profiles else 'default')
+    allowed_workspaces = _normalize_workspace_list(entry.get('allowed_workspaces') or [])
+    default_workspace = str(entry.get('default_workspace') or '').strip() or (allowed_workspaces[0] if allowed_workspaces else None)
+    username = str(entry.get('username') or '').strip().lower() or None
+    return {
+        'token': token,
+        'exp': float(exp),
+        'username': username,
+        'allowed_profiles': allowed_profiles,
+        'default_profile': default_profile,
+        'allowed_workspaces': allowed_workspaces,
+        'default_workspace': default_workspace,
+        'is_admin': bool(entry.get('is_admin', False) or not username),
+    }
+
+
+def verify_session(cookie_value) -> bool:
+    """Verify a signed session cookie. Returns True if valid and not expired."""
+    return get_session_record(cookie_value) is not None
 
 
 def invalidate_session(cookie_value) -> None:
@@ -219,7 +431,9 @@ def check_auth(handler, parsed) -> bool:
         return True
     # Check session cookie
     cookie_val = parse_cookie(handler)
-    if cookie_val and verify_session(cookie_val):
+    record = get_session_record(cookie_val)
+    if record:
+        set_request_auth(record)
         return True
     # Not authorized
     if parsed.path.startswith('/api/'):
@@ -232,6 +446,68 @@ def check_auth(handler, parsed) -> bool:
         handler.send_header('Location', '/login')
         handler.end_headers()
     return False
+
+
+def set_request_auth(record: dict | None) -> None:
+    _tls.auth = record or None
+
+
+def clear_request_auth() -> None:
+    _tls.auth = None
+
+
+def get_request_auth() -> dict | None:
+    return getattr(_tls, 'auth', None)
+
+
+def get_request_username() -> str | None:
+    auth = get_request_auth()
+    return (auth or {}).get('username')
+
+
+def is_request_admin() -> bool:
+    auth = get_request_auth()
+    if auth is None:
+        return True if not is_auth_enabled() else False
+    return bool(auth.get('is_admin', False))
+
+
+def can_access_profile(name: str | None, auth: dict | None = None) -> bool:
+    profile = str(name or 'default').strip() or 'default'
+    auth = get_request_auth() if auth is None else auth
+    if auth is None:
+        return True if not is_auth_enabled() else False
+    if auth.get('is_admin'):
+        return True
+    return profile in set(auth.get('allowed_profiles') or [])
+
+
+def can_access_workspace(path: str | None, auth: dict | None = None) -> bool:
+    """Return True when the current user may use the workspace path."""
+    auth = get_request_auth() if auth is None else auth
+    if auth is None:
+        return True if not is_auth_enabled() else False
+    if auth.get('is_admin'):
+        return True
+    if not path:
+        return False
+    try:
+        target = str(Path(path).expanduser().resolve())
+    except Exception:
+        target = str(path or '').strip()
+    return target in set(_normalize_workspace_list(auth.get('allowed_workspaces') or []))
+
+
+def get_request_default_workspace(auth: dict | None = None) -> str | None:
+    """Return the request-scoped default workspace, if configured."""
+    auth = get_request_auth() if auth is None else auth
+    if auth is None:
+        return None
+    default_workspace = str(auth.get('default_workspace') or '').strip()
+    if default_workspace:
+        return default_workspace
+    allowed = _normalize_workspace_list(auth.get('allowed_workspaces') or [])
+    return allowed[0] if allowed else None
 
 
 def set_auth_cookie(handler, cookie_value) -> None:

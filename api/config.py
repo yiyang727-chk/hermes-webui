@@ -28,8 +28,8 @@ HOME = Path.home()
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
 # ── Network config (env-overridable) ─────────────────────────────────────────
-HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
-PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
+HOST = os.getenv("HERMES_WEBUI_HOST", "0.0.0.0")
+PORT = int(os.getenv("HERMES_WEBUI_PORT", "8080"))
 
 # ── TLS/HTTPS config (optional, env-overridable) ────────────────────────────
 TLS_CERT = os.getenv("HERMES_WEBUI_TLS_CERT", "").strip() or None
@@ -2204,6 +2204,7 @@ _SETTINGS_DEFAULTS = {
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "busy_input_mode": "queue",  # behavior when sending while agent is running: queue | interrupt | steer
     "password_hash": None,  # PBKDF2-HMAC-SHA256 hash; None = auth disabled
+    "auth_users": [],  # local webui accounts mapped to allowed Hermes profiles
 }
 _SETTINGS_LEGACY_DROP_KEYS = {"assistant_language", "bubble_layout", "default_model"}
 _SETTINGS_THEME_VALUES = {"light", "dark", "system"}
@@ -2293,6 +2294,9 @@ def load_settings() -> dict:
         stored.get("skin") if isinstance(stored, dict) else settings.get("skin"),
     )
     settings["default_model"] = get_effective_default_model()
+    users = settings.get("auth_users")
+    if not isinstance(users, list):
+        settings["auth_users"] = []
     return settings
 
 
@@ -2339,6 +2343,54 @@ def save_settings(settings: dict) -> dict:
     # Handle _clear_password: explicitly disable auth
     if settings.pop("_clear_password", False):
         current["password_hash"] = None
+        current["auth_users"] = []
+    auth_users = settings.pop("auth_users", None)
+    if auth_users is not None:
+        from api.auth import _hash_password, _normalize_profile_list, _normalize_workspace_list
+        existing_by_name = {
+            str(u.get("username") or "").strip().lower(): u
+            for u in current.get("auth_users", [])
+            if isinstance(u, dict)
+        }
+        normalized_users = []
+        seen = set()
+        for item in auth_users if isinstance(auth_users, list) else []:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or "").strip().lower()
+            if not username or username in seen:
+                continue
+            password = str(item.get("password") or "").strip()
+            existing = existing_by_name.get(username) or {}
+            password_hash = password and _hash_password(password) or str(existing.get("password_hash") or "").strip()
+            if not password_hash:
+                continue
+            allowed_profiles = _normalize_profile_list(item.get("allowed_profiles") or existing.get("allowed_profiles") or [])
+            if not allowed_profiles:
+                allowed_profiles = ["default"]
+            default_profile = str(item.get("default_profile") or existing.get("default_profile") or "").strip()
+            if default_profile not in allowed_profiles:
+                default_profile = allowed_profiles[0]
+            allowed_workspaces = _normalize_workspace_list(item.get("allowed_workspaces") or existing.get("allowed_workspaces") or [])
+            default_workspace = str(item.get("default_workspace") or existing.get("default_workspace") or "").strip()
+            if default_workspace:
+                normalized_default = _normalize_workspace_list([default_workspace])
+                default_workspace = normalized_default[0] if normalized_default else ""
+            if default_workspace and default_workspace not in allowed_workspaces:
+                allowed_workspaces.append(default_workspace)
+            if not default_workspace and allowed_workspaces:
+                default_workspace = allowed_workspaces[0]
+            seen.add(username)
+            normalized_users.append({
+                "username": username,
+                "password_hash": password_hash,
+                "allowed_profiles": allowed_profiles,
+                "default_profile": default_profile,
+                "allowed_workspaces": allowed_workspaces,
+                "default_workspace": default_workspace or None,
+                "is_admin": bool(item.get("is_admin", existing.get("is_admin", False))),
+            })
+        current["auth_users"] = normalized_users
     for k, v in settings.items():
         if k in _SETTINGS_ALLOWED_KEYS:
             if k == "theme":

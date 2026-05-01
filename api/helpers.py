@@ -257,3 +257,15 @@ def build_profile_cookie(name: str) -> str:
     cookie[PROFILE_COOKIE_NAME]['httponly'] = True
     cookie[PROFILE_COOKIE_NAME]['samesite'] = 'Lax'
     return cookie[PROFILE_COOKIE_NAME].OutputString()
+
+
+def clear_profile_cookie() -> str:
+    """Build a Set-Cookie header value that clears the hermes_profile cookie."""
+    import http.cookies as _hc
+    cookie = _hc.SimpleCookie()
+    cookie[PROFILE_COOKIE_NAME] = ''
+    cookie[PROFILE_COOKIE_NAME]['path'] = '/'
+    cookie[PROFILE_COOKIE_NAME]['httponly'] = True
+    cookie[PROFILE_COOKIE_NAME]['max-age'] = '0'
+    cookie[PROFILE_COOKIE_NAME]['samesite'] = 'Lax'
+    return cookie[PROFILE_COOKIE_NAME].OutputString()

@@ -158,7 +158,7 @@ docker run -d \
 -p 8787:8787 hermes-webui
 ```
 
-Open http://localhost:8787 in your browser.
+Open http://localhost:8080 in your browser.
 
 To enable password protection:
 
@@ -286,7 +286,7 @@ See `docker-compose.three-container.yml` for the full reference configuration.
 | Python executable | Agent venv first, then `.venv` in this repo, then system `python3` |
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `~/.hermes/webui-mvp` |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
-| Port | `HERMES_WEBUI_PORT` env or first argument, default `8787` |
+| Port | `HERMES_WEBUI_PORT` env or first argument, default `8080` |
 
 If discovery finds everything, nothing else is required.
 
@@ -314,8 +314,8 @@ Full list of environment variables:
 |---|---|---|
 | `HERMES_WEBUI_AGENT_DIR` | auto-discovered | Path to the hermes-agent checkout |
 | `HERMES_WEBUI_PYTHON` | auto-discovered | Python executable |
-| `HERMES_WEBUI_HOST` | `127.0.0.1` | Bind address |
-| `HERMES_WEBUI_PORT` | `8787` | Port |
+| `HERMES_WEBUI_HOST` | `0.0.0.0` | Bind address |
+| `HERMES_WEBUI_PORT` | `8080` | Port |
 | `HERMES_WEBUI_STATE_DIR` | `~/.hermes/webui-mvp` | Where sessions and state are stored |
 | `HERMES_WEBUI_DEFAULT_WORKSPACE` | `~/workspace` | Default workspace |
 | `HERMES_WEBUI_DEFAULT_MODEL` | `openai/gpt-5.4-mini` | Default model |
@@ -327,7 +327,7 @@ Full list of environment variables:
 
 ## Accessing from a remote machine
 
-The server binds to `127.0.0.1` by default (loopback only). If you are running
+The server binds to `0.0.0.0` by default. If you are running
 Hermes on a VPS or remote server, use an SSH tunnel from your local machine:
 
 ```bash

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-from api.auth import check_auth
+from api.auth import check_auth, clear_request_auth
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
 from api.helpers import j, get_profile_cookie
 from api.profiles import set_request_profile, clear_request_profile
@@ -67,13 +67,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._req_t0 = time.time()
-        # Per-request profile context from cookie (issue #798)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
             if not check_auth(self, parsed): return
+            # Per-request profile context from cookie (issue #798), gated by auth ACLs.
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                from api.auth import can_access_profile
+                if can_access_profile(cookie_profile):
+                    set_request_profile(cookie_profile)
             result = handle_get(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
@@ -81,17 +83,20 @@ class Handler(BaseHTTPRequestHandler):
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
             return j(self, {'error': 'Internal server error'}, status=500)
         finally:
+            clear_request_auth()
             clear_request_profile()
 
     def do_POST(self) -> None:
         self._req_t0 = time.time()
-        # Per-request profile context from cookie (issue #798)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
             if not check_auth(self, parsed): return
+            # Per-request profile context from cookie (issue #798), gated by auth ACLs.
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                from api.auth import can_access_profile
+                if can_access_profile(cookie_profile):
+                    set_request_profile(cookie_profile)
             result = handle_post(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
@@ -99,6 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
             return j(self, {'error': 'Internal server error'}, status=500)
         finally:
+            clear_request_auth()
             clear_request_profile()
 
 

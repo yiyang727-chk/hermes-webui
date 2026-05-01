@@ -5,6 +5,7 @@
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
+  var usernameInput = document.getElementById('username');
 
   if (!form || !input) return;
 
@@ -43,7 +44,7 @@ document.addEventListener('DOMContentLoaded', function () {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify({ username: usernameInput ? usernameInput.value : '', password: pw }),
         credentials: 'include',
       });
       var data = {};

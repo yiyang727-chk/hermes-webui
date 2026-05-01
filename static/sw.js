@@ -29,6 +29,13 @@ const SHELL_ASSETS = [
   './manifest.json',
 ];
 
+const SHELL_PATHS = new Set(
+  SHELL_ASSETS.map((asset) => {
+    if (asset === './') return '/';
+    return asset.startsWith('./') ? asset.slice(1) : asset;
+  })
+);
+
 // Install: pre-cache the app shell
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -81,35 +88,42 @@ self.addEventListener('fetch', (event) => {
     return; // let browser handle normally
   }
 
-  // Shell assets: cache-first
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
-        // Cache successful GET responses for shell assets
-        if (
-          event.request.method === 'GET' &&
-          response.status === 200
-        ) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-        }
-        return response;
-      }).catch(() => {
-        // Offline fallback for navigation requests.
-        // Note: caches.match() returns a Promise (always truthy in a `||` check),
-        // so we must await/then to unwrap it — otherwise the `new Response(...)`
-        // branch is dead code and the browser falls back to its default offline page.
-        if (event.request.mode === 'navigate') {
-          return caches.match('./').then((cached) => cached || new Response(
-            '<html><body style="font-family:sans-serif;padding:2rem;background:#1a1a1a;color:#ccc">' +
-            '<h2>You are offline</h2>' +
-            '<p>Hermes requires a server connection. Please check your network and try again.</p>' +
-            '</body></html>',
-            { headers: { 'Content-Type': 'text/html' } }
-          ));
-        }
-      });
-    })
-  );
+  const isShellAsset = event.request.method === 'GET' && SHELL_PATHS.has(url.pathname);
+
+  // Navigation requests should prefer the network so auth/login/profile UI
+  // updates do not get stuck behind an older cached document shell.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request).catch(() =>
+        caches.match('./').then((cached) => cached || new Response(
+          '<html><body style="font-family:sans-serif;padding:2rem;background:#1a1a1a;color:#ccc">' +
+          '<h2>You are offline</h2>' +
+          '<p>Hermes requires a server connection. Please check your network and try again.</p>' +
+          '</body></html>',
+          { headers: { 'Content-Type': 'text/html' } }
+        ))
+      )
+    );
+    return;
+  }
+
+  // Explicit shell assets: cache-first.
+  if (isShellAsset) {
+    event.respondWith(
+      caches.match(event.request).then((cached) => {
+        if (cached) return cached;
+        return fetch(event.request).then((response) => {
+          if (response.status === 200) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          }
+          return response;
+        });
+      })
+    );
+    return;
+  }
+
+  // Everything else: network only.
+  event.respondWith(fetch(event.request));
 });

@@ -2521,6 +2521,8 @@ async function checkInflightOnBoot(sid) {
 }
 
 function syncTopbar(){
+  const profileLabel=$('profileChipLabel');
+  if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
   if(!S.session){
     document.title=window._botName||'Hermes';
     if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
@@ -2596,9 +2598,6 @@ function syncTopbar(){
   if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
   if(typeof syncTerminalButton==='function') syncTerminalButton();
   // modelSelect already set above
-  // Update profile chip label
-  const profileLabel=$('profileChipLabel');
-  if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
 }
 
 function msgContent(m){

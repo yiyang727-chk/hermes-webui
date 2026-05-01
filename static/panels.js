@@ -5,6 +5,7 @@ let _cronList = null; // cached cron jobs (array)
 let _currentCronDetail = null; // full cron job object
 let _cronMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _cronPreFormDetail = null; // snapshot of prior selection when entering a form
+let _cronDeliverOptionsCache = null;
 let _currentWorkspaceDetail = null; // { path, name, is_default }
 let _workspaceMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _workspacePreFormDetail = null;
@@ -19,6 +20,64 @@ const APP_TITLEBAR_KEYS = {
   memory: 'tab_memory', workspaces: 'tab_workspaces',
   profiles: 'tab_profiles', todos: 'tab_todos', settings: 'tab_settings',
 };
+
+function _isAdminUser() {
+  const status = _settingsAuthStatus || window._authStatus || null;
+  if (!status || !status.auth_enabled) return true;
+  return !!status.is_admin;
+}
+
+function _isRestrictedUser() {
+  const status = _settingsAuthStatus || window._authStatus || null;
+  return !!(status && status.auth_enabled && !status.is_admin);
+}
+
+function _requireAdminUi(message = 'Admin access required') {
+  if (_isAdminUser()) return true;
+  if (typeof showToast === 'function') showToast(message, 2500, 'error');
+  return false;
+}
+
+function _setElementVisible(el, visible, display = '') {
+  if (!el) return;
+  el.style.display = visible ? display : 'none';
+}
+
+function _setSettingsPaneReadonly(paneId, noteId, readonly) {
+  const pane = $(paneId);
+  const note = $(noteId);
+  if (note) note.style.display = readonly ? '' : 'none';
+  if (!pane) return;
+  pane.querySelectorAll('input, select, textarea, button.theme-pick-btn, button.skin-pick-btn, button.font-size-pick-btn').forEach(el => {
+    if (el.id === 'btnSaveAppearanceSettings' || el.id === 'btnSavePreferencesSettings' || el.id === 'btnSaveSystemSettings') return;
+    el.disabled = !!readonly;
+    el.classList.toggle('disabled', !!readonly);
+    if (readonly && el.tagName === 'BUTTON') el.style.cursor = 'not-allowed';
+    else if (el.tagName === 'BUTTON') el.style.cursor = '';
+  });
+}
+
+function _applySettingsReadonlyState() {
+  const readonly = _isRestrictedUser();
+  _setSettingsPaneReadonly('settingsPaneAppearance', 'settingsAppearanceReadonlyNote', readonly);
+  _setSettingsPaneReadonly('settingsPanePreferences', 'settingsPreferencesReadonlyNote', readonly);
+}
+
+function _applyAdminUiVisibility() {
+  const isAdmin = _isAdminUser();
+  document.querySelectorAll('#settingsMenu [data-admin-only="true"]').forEach(el => {
+    el.style.display = isAdmin ? '' : 'none';
+  });
+  _setElementVisible($('btnOpenWorkspaceCreate'), isAdmin, '');
+  _setElementVisible($('btnOpenProfileCreate'), isAdmin, '');
+  _setElementVisible($('btnSaveAppearanceSettings'), isAdmin, '');
+  _setElementVisible($('btnSavePreferencesSettings'), isAdmin, '');
+  _setElementVisible($('btnSaveSystemSettings'), isAdmin, '');
+  _applySettingsReadonlyState();
+  if (!isAdmin && _currentPanel === 'settings' && (_currentSettingsSection === 'providers' || _currentSettingsSection === 'system')) {
+    switchSettingsSection('conversation');
+  }
+}
 
 /**
  * Update the top app titlebar to reflect the current page or selected conversation.
@@ -517,6 +576,79 @@ let _cronSelectedSkills=[];
 let _cronIsDuplicate = false;
 let _cronSkillsCache=null;
 
+function _fallbackCronDeliverLabel(value) {
+  const labels = {
+    local: t('cron_deliver_local') || 'Local (save output only)',
+    telegram: 'Telegram',
+    discord: 'Discord',
+    slack: 'Slack',
+    whatsapp: 'WhatsApp',
+    signal: 'Signal',
+    matrix: 'Matrix',
+    mattermost: 'Mattermost',
+    homeassistant: 'Home Assistant',
+    dingtalk: 'DingTalk',
+    feishu: 'Feishu',
+    wecom: 'WeCom',
+    wecom_callback: 'WeCom Callback',
+    weixin: 'Weixin',
+    sms: 'SMS',
+    email: 'Email',
+    webhook: 'Webhook',
+    bluebubbles: 'BlueBubbles',
+    qqbot: 'QQ Bot',
+  };
+  return labels[value] || value;
+}
+
+function _normalizeCronDeliverOptions(options, selectedValue) {
+  const normalized = [];
+  const seen = new Set();
+  const append = (value, label) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    normalized.push({ value, label: label || _fallbackCronDeliverLabel(value) });
+  };
+  append('local', t('cron_deliver_local') || 'Local (save output only)');
+  if (Array.isArray(options)) {
+    for (const opt of options) append(opt && opt.value, opt && opt.label);
+  }
+  if (selectedValue && !seen.has(selectedValue)) append(selectedValue, _fallbackCronDeliverLabel(selectedValue));
+  return normalized;
+}
+
+function _renderCronDeliverOptions(options, selectedValue) {
+  return _normalizeCronDeliverOptions(options, selectedValue)
+    .map(opt => `<option value="${esc(opt.value)}"${selectedValue===opt.value?' selected':''}>${esc(opt.label)}</option>`)
+    .join('');
+}
+
+async function _loadCronDeliverOptions(force = false) {
+  if (!force && Array.isArray(_cronDeliverOptionsCache)) return _cronDeliverOptionsCache;
+  try {
+    const data = await api('/api/crons/deliver-options');
+    _cronDeliverOptionsCache = Array.isArray(data && data.options) ? data.options : [];
+  } catch (_) {
+    if (!Array.isArray(_cronDeliverOptionsCache)) _cronDeliverOptionsCache = [];
+  }
+  return _cronDeliverOptionsCache;
+}
+
+function _refreshCronDeliverSelect(selectedValue, isEdit) {
+  const el = $('cronFormDeliver');
+  if (!el) return;
+  const currentValue = selectedValue || el.value || 'local';
+  el.innerHTML = _renderCronDeliverOptions(_cronDeliverOptionsCache, currentValue);
+  el.value = currentValue;
+  el.disabled = !!isEdit;
+}
+
+function _hydrateCronDeliverOptions(selectedValue, isEdit) {
+  _loadCronDeliverOptions().then(() => {
+    _refreshCronDeliverSelect(selectedValue, isEdit);
+  }).catch(() => {});
+}
+
 function openCronCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
   _cronPreFormDetail = _currentCronDetail ? { ..._currentCronDetail } : null;
@@ -525,6 +657,7 @@ function openCronCreate(){
   _cronIsDuplicate = false;
   _cronSelectedSkills = [];
   _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', isEdit:false });
+  _hydrateCronDeliverOptions('local', false);
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
 }
@@ -542,6 +675,7 @@ function openCronEdit(job){
     deliver: job.deliver || 'local',
     isEdit: true,
   });
+  _hydrateCronDeliverOptions(job.deliver || 'local', true);
   if (!_cronSkillsCache) {
     api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   } else {
@@ -555,7 +689,6 @@ function _renderCronForm({ name, schedule, prompt, deliver, isEdit }){
   const empty = $('taskDetailEmpty');
   if (!body || !title) return;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
-  const deliverOpt = (v,l) => `<option value="${v}"${deliver===v?' selected':''}>${esc(l)}</option>`;
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveCronForm();">
@@ -575,9 +708,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, isEdit }){
         <div class="detail-form-row">
           <label for="cronFormDeliver">${esc(t('cron_deliver_label') || 'Deliver output to')}</label>
           <select id="cronFormDeliver" ${isEdit ? 'disabled' : ''}>
-            ${deliverOpt('local', t('cron_deliver_local') || 'Local (save output only)')}
-            ${deliverOpt('discord','Discord')}
-            ${deliverOpt('telegram','Telegram')}
+            ${_renderCronDeliverOptions(_cronDeliverOptionsCache, deliver || 'local')}
           </select>
         </div>
         <div class="detail-form-row">
@@ -1446,6 +1577,7 @@ async function loadWorkspaceList(){
   try{
     const data = await api('/api/workspaces');
     _workspaceList = data.workspaces || [];
+    if(data.last) S._profileDefaultWorkspace=data.last;
     syncWorkspaceDisplays();
     return data;
   }catch(e){ return {workspaces:[], last:''}; }
@@ -1495,20 +1627,24 @@ function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
     opt.onclick=()=>switchToWorkspace(w.path,w.name);
     dd.appendChild(opt);
   }
-  dd.appendChild(document.createElement('div')).className='ws-divider';
-  dd.appendChild(_renderWorkspaceAction(
-    t('workspace_choose_path'),
-    t('workspace_choose_path_meta'),
-    li('folder',12),
-    ()=>promptWorkspacePath()
-  ));
-  const div=document.createElement('div');div.className='ws-divider';dd.appendChild(div);
-  dd.appendChild(_renderWorkspaceAction(
-    t('workspace_manage'),
-    t('workspace_manage_meta'),
-    li('settings',12),
-    ()=>{closeWsDropdown();mobileSwitchPanel('workspaces');}
-  ));
+  if (_isAdminUser()) {
+    dd.appendChild(document.createElement('div')).className='ws-divider';
+    dd.appendChild(_renderWorkspaceAction(
+      t('workspace_choose_path'),
+      t('workspace_choose_path_meta'),
+      li('folder',12),
+      ()=>promptWorkspacePath()
+    ));
+  }
+  if (_isAdminUser()) {
+    const div=document.createElement('div');div.className='ws-divider';dd.appendChild(div);
+    dd.appendChild(_renderWorkspaceAction(
+      t('workspace_manage'),
+      t('workspace_manage_meta'),
+      li('settings',12),
+      ()=>{closeWsDropdown();mobileSwitchPanel('workspaces');}
+    ));
+  }
 }
 
 function toggleWsDropdown(){
@@ -1694,16 +1830,24 @@ function _setWorkspaceHeaderButtons(mode, ws){
   const saveBtn = $('btnSaveWorkspaceDetail');
   const show = b => b && (b.style.display = '');
   const hide = b => b && (b.style.display = 'none');
+  const isAdmin = _isAdminUser();
   if (mode === 'read') {
     const activePath = S.session ? S.session.workspace : '';
     const isActive = ws && ws.path === activePath;
     const isDefault = !!(ws && ws.is_default);
     if (isActive) hide(actBtn); else show(actBtn);
-    show(editBtn);
-    if (isDefault) hide(delBtn); else show(delBtn);
+    if (isAdmin) {
+      show(editBtn);
+      if (isDefault) hide(delBtn); else show(delBtn);
+    } else {
+      hide(editBtn);
+      hide(delBtn);
+    }
     hide(cancelBtn); hide(saveBtn);
   } else if (mode === 'create' || mode === 'edit') {
-    hide(actBtn); hide(editBtn); hide(delBtn); show(cancelBtn); show(saveBtn);
+    hide(actBtn); hide(editBtn); hide(delBtn);
+    if (isAdmin) { show(cancelBtn); show(saveBtn); }
+    else { hide(cancelBtn); hide(saveBtn); }
   } else {
     [actBtn, editBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
   }
@@ -1740,6 +1884,7 @@ async function activateCurrentWorkspace(){
 }
 
 async function deleteCurrentWorkspace(){
+  if (!_requireAdminUi()) return;
   if (!_currentWorkspaceDetail) return;
   const path = _currentWorkspaceDetail.path;
   const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
@@ -1754,6 +1899,7 @@ async function deleteCurrentWorkspace(){
 }
 
 function openWorkspaceCreate(){
+  if (!_requireAdminUi()) return;
   if (typeof switchPanel === 'function' && _currentPanel !== 'workspaces') switchPanel('workspaces');
   _workspacePreFormDetail = _currentWorkspaceDetail ? { ..._currentWorkspaceDetail } : null;
   _workspaceMode = 'create';
@@ -1761,6 +1907,7 @@ function openWorkspaceCreate(){
 }
 
 function editCurrentWorkspace(){
+  if (!_requireAdminUi()) return;
   if (!_currentWorkspaceDetail) return;
   _workspacePreFormDetail = { ..._currentWorkspaceDetail };
   _workspaceMode = 'edit';
@@ -1815,6 +1962,7 @@ function cancelWorkspaceForm(){
 }
 
 async function saveWorkspaceForm(){
+  if (!_requireAdminUi()) return;
   const nameEl = $('workspaceFormName');
   const pathEl = $('workspaceFormPath');
   const errEl = $('workspaceFormError');
@@ -1908,6 +2056,7 @@ document.addEventListener('click',e=>{
 });
 
 async function removeWorkspace(path){
+  if (!_requireAdminUi()) return;
   const _rmWs=await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_rmWs) return;
   try{
@@ -1919,6 +2068,7 @@ async function removeWorkspace(path){
 }
 
 async function promptWorkspacePath(){
+  if (!_requireAdminUi()) return;
   // Opus review Q6: if called from blank page (no session), auto-create one first.
   if(!S.session){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
@@ -1997,6 +2147,179 @@ async function switchToWorkspace(path,name){
 
 // ── Profile panel + dropdown ──
 let _profilesCache = null;
+let _currentProfileChannelConfig = null;
+let _profileQrSessions = {};
+let _profileQrPollTimers = {};
+
+const PROFILE_CHANNEL_FORM_SPECS = {
+  weixin: {
+    label: 'Weixin / WeChat',
+    supportsQr: true,
+    note: '',
+    fields: [
+      { key: 'account_id', label: 'Account ID' },
+      { key: 'token', label: 'Token', type: 'password', secret: true, placeholder: '留空则保留现有 Token' },
+      { key: 'base_url', label: 'Base URL', placeholder: 'https://ilinkai.weixin.qq.com' },
+      { key: 'cdn_base_url', label: 'CDN Base URL', placeholder: 'https://novac2c.cdn.weixin.qq.com/c2c' },
+      { key: 'dm_policy', label: 'DM 策略', type: 'select', options: [
+        { value: 'pairing', label: '配对审批' },
+        { value: 'open', label: '允许所有私聊' },
+        { value: 'allowlist', label: '仅允许白名单' },
+        { value: 'disabled', label: '禁用私聊' },
+      ]},
+      { key: 'allowed_users', label: '允许的私聊用户', placeholder: '逗号分隔 user_id' },
+      { key: 'group_policy', label: '群聊策略', type: 'select', options: [
+        { value: 'disabled', label: '禁用群聊' },
+        { value: 'open', label: '允许所有群聊' },
+        { value: 'allowlist', label: '仅允许白名单群聊' },
+      ]},
+      { key: 'group_allowed_users', label: '允许的群聊 ID', placeholder: '逗号分隔 group_id' },
+      { key: 'home_channel', label: 'Home Channel', placeholder: '用于 cron / 通知投递' },
+    ],
+  },
+  qqbot: {
+    label: 'QQ Bot',
+    supportsQr: false,
+    note: 'Hermes 当前通过 QQ 官方 Bot App ID / Secret 接入，不支持扫码登录。',
+    fields: [
+      { key: 'app_id', label: 'App ID' },
+      { key: 'client_secret', label: 'App Secret', type: 'password', secret: true, placeholder: '留空则保留现有 Secret' },
+      { key: 'allowed_users', label: '允许的私聊用户', placeholder: '逗号分隔 OpenID，留空表示开放' },
+      { key: 'group_policy', label: '群聊策略', type: 'select', options: [
+        { value: 'open', label: '允许所有群聊' },
+        { value: 'allowlist', label: '仅允许白名单' },
+        { value: 'disabled', label: '禁用群聊' },
+      ]},
+      { key: 'group_allowed_users', label: '允许的群聊 OpenID', placeholder: '逗号分隔 group OpenID' },
+      { key: 'home_channel', label: 'Home Channel', placeholder: 'cron / 通知投递目标 OpenID' },
+    ],
+  },
+  wecom: {
+    label: 'WeCom',
+    supportsQr: false,
+    note: '',
+    fields: [
+      { key: 'bot_id', label: 'Bot ID' },
+      { key: 'secret', label: 'Secret', type: 'password', secret: true, placeholder: '留空则保留现有 Secret' },
+      { key: 'websocket_url', label: 'WebSocket URL', placeholder: 'wss://openws.work.weixin.qq.com' },
+      { key: 'dm_policy', label: 'DM 策略', type: 'select', options: [
+        { value: 'pairing', label: '配对审批' },
+        { value: 'open', label: '允许所有私聊' },
+        { value: 'allowlist', label: '仅允许白名单' },
+        { value: 'disabled', label: '禁用私聊' },
+      ]},
+      { key: 'allowed_users', label: '允许的私聊用户', placeholder: '逗号分隔 user_id' },
+      { key: 'group_policy', label: '群聊策略', type: 'select', options: [
+        { value: 'open', label: '允许所有群聊' },
+        { value: 'allowlist', label: '仅允许白名单' },
+        { value: 'disabled', label: '禁用群聊' },
+      ]},
+      { key: 'group_allowed_users', label: '允许的群聊 ID', placeholder: '逗号分隔 chat_id' },
+      { key: 'home_channel', label: 'Home Channel', placeholder: 'cron / 通知投递目标 chat_id' },
+    ],
+  },
+  feishu: {
+    label: 'Feishu / Lark',
+    supportsQr: true,
+    note: '',
+    fields: [
+      { key: 'app_id', label: 'App ID' },
+      { key: 'app_secret', label: 'App Secret', type: 'password', secret: true, placeholder: '留空则保留现有 Secret' },
+      { key: 'domain', label: 'Domain', type: 'select', options: [
+        { value: 'feishu', label: 'Feishu' },
+        { value: 'lark', label: 'Lark' },
+      ]},
+      { key: 'connection_mode', label: 'Connection Mode', type: 'select', options: [
+        { value: 'websocket', label: 'WebSocket' },
+        { value: 'webhook', label: 'Webhook' },
+      ]},
+      { key: 'dm_policy', label: 'DM 策略', type: 'select', options: [
+        { value: 'pairing', label: '配对审批' },
+        { value: 'open', label: '允许所有私聊' },
+        { value: 'allowlist', label: '仅允许白名单' },
+      ]},
+      { key: 'allowed_users', label: '允许的私聊用户', placeholder: '逗号分隔 open_id' },
+      { key: 'group_policy', label: '群聊策略', type: 'select', options: [
+        { value: 'open', label: '@ 提及时响应' },
+        { value: 'disabled', label: '禁用群聊' },
+      ]},
+      { key: 'home_channel', label: 'Home Channel', placeholder: 'cron / 通知投递目标 chat_id' },
+    ],
+  },
+};
+
+function _profileChannelsForRender(config) {
+  return (config && Array.isArray(config.channels)) ? config.channels : [];
+}
+
+function _profileChannelByPlatform(platform) {
+  return _profileChannelsForRender(_currentProfileChannelConfig).find(ch => ch.platform === platform) || null;
+}
+
+function _stopProfileQrPolling(platform) {
+  const clearOne = (key) => {
+    if (_profileQrPollTimers[key]) {
+      clearTimeout(_profileQrPollTimers[key]);
+      delete _profileQrPollTimers[key];
+    }
+    delete _profileQrSessions[key];
+  };
+  if (platform) {
+    clearOne(platform);
+    return;
+  }
+  Object.keys(_profileQrPollTimers).forEach(clearOne);
+}
+
+function _profileQrImageUrl(payload) {
+  if (!payload) return '';
+  if (payload.qr_image_url) return payload.qr_image_url;
+  if (payload.qr_url) return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(payload.qr_url)}`;
+  return '';
+}
+
+function _renderProfileChannelsRead() {
+  const channels = _profileChannelsForRender(_currentProfileChannelConfig);
+  if (!channels.length) {
+    return `<div class="detail-card"><div class="detail-card-title">Channels</div><div style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div></div>`;
+  }
+  const cards = channels.map(ch => {
+    const status = ch.configured ? '已配置' : (ch.enabled ? '部分配置' : '未启用');
+    const statusClass = ch.configured ? 'ok' : (ch.enabled ? 'warn' : '');
+    const note = ch.note ? `<div class="detail-form-hint" style="margin-top:8px">${esc(ch.note)}</div>` : '';
+    const extras = [];
+    if (ch.fields && ch.fields.home_channel) extras.push(`Home: ${ch.fields.home_channel}`);
+    if (ch.fields && ch.fields.connection_mode) extras.push(`Mode: ${ch.fields.connection_mode}`);
+    if (ch.fields && ch.fields.dm_policy) extras.push(`DM: ${ch.fields.dm_policy}`);
+    return `<div class="detail-card">
+      <div class="detail-card-title">${esc(ch.label)}</div>
+      <div class="detail-row"><div class="detail-row-label">状态</div><div class="detail-row-value"><span class="detail-badge ${statusClass}">${esc(status)}</span></div></div>
+      ${extras.length ? `<div class="detail-row"><div class="detail-row-label">摘要</div><div class="detail-row-value">${esc(extras.join(' · '))}</div></div>` : ''}
+      ${note}
+    </div>`;
+  }).join('');
+  return cards;
+}
+
+async function _loadProfileChannels(name, opts = {}) {
+  const { reRender = true, silent = false } = opts;
+  try {
+    const data = await api(`/api/profile/channels?name=${encodeURIComponent(name)}`);
+    if (!_currentProfileDetail || _currentProfileDetail.name !== name) return data;
+    _currentProfileChannelConfig = data;
+    if (!reRender) return data;
+    if (_profileMode === 'read') {
+      const activeName = _profilesCache ? _profilesCache.active : null;
+      _renderProfileDetail(_currentProfileDetail, activeName);
+    } else if (_profileMode === 'edit') {
+      _renderProfileEditForm();
+    }
+    return data;
+  } catch (e) {
+    if (!silent) showToast((t('error_prefix') || 'Error: ') + e.message, 3000, 'error');
+    return null;
+  }
+}
 
 async function loadProfilesPanel() {
   const panel = $('profilesPanel');
@@ -2038,11 +2361,12 @@ async function loadProfilesPanel() {
       if (_currentProfileDetail && _currentProfileDetail.name === p.name) card.classList.add('active');
       panel.appendChild(card);
     }
-    // Re-render detail with fresh data if we have one and we're not in a form
     if (_currentProfileDetail && _profileMode !== 'create') {
       const refreshed = data.profiles.find(p => p.name === _currentProfileDetail.name);
-      if (refreshed) _renderProfileDetail(refreshed, data.active);
-      else _clearProfileDetail();
+      if (refreshed) {
+        _currentProfileDetail = refreshed;
+        if (_profileMode === 'read') _renderProfileDetail(refreshed, data.active);
+      } else _clearProfileDetail();
     }
   } catch (e) {
     panel.innerHTML = `<div style="color:var(--accent);font-size:12px;padding:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
@@ -2080,6 +2404,7 @@ function _renderProfileDetail(p, activeName){
         <div class="detail-card-title">Profile</div>
         ${rows.join('')}
       </div>
+      ${_renderProfileChannelsRead()}
     </div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
@@ -2089,21 +2414,26 @@ function _renderProfileDetail(p, activeName){
 
 function _setProfileHeaderButtons(mode, p, activeName){
   const actBtn = $('btnActivateProfileDetail');
+  const editBtn = $('btnEditProfileDetail');
   const delBtn = $('btnDeleteProfileDetail');
   const cancelBtn = $('btnCancelProfileDetail');
   const saveBtn = $('btnSaveProfileDetail');
   const show = b => b && (b.style.display = '');
   const hide = b => b && (b.style.display = 'none');
+  const isAdmin = _isAdminUser();
   if (mode === 'read') {
     const isActive = p && p.name === activeName;
     const isDefault = !!(p && p.is_default);
     if (isActive) hide(actBtn); else show(actBtn);
-    if (isDefault) hide(delBtn); else show(delBtn);
+    if (p) show(editBtn); else hide(editBtn);
+    if (isAdmin && !isDefault) show(delBtn);
+    else hide(delBtn);
     hide(cancelBtn); hide(saveBtn);
-  } else if (mode === 'create') {
-    hide(actBtn); hide(delBtn); show(cancelBtn); show(saveBtn);
+  } else if (mode === 'create' || mode === 'edit') {
+    hide(actBtn); hide(editBtn); hide(delBtn);
+    show(cancelBtn); show(saveBtn);
   } else {
-    [actBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
+    [actBtn, editBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
   }
 }
 
@@ -2115,12 +2445,17 @@ function openProfileDetail(name, el){
   const target = el || document.querySelector(`.profile-card[data-name="${CSS.escape(name)}"]`);
   if (target) target.classList.add('active');
   _profilePreFormDetail = null;
+  _stopProfileQrPolling();
+  _currentProfileChannelConfig = null;
   _renderProfileDetail(p, _profilesCache.active);
+  _loadProfileChannels(name, { silent: true });
 }
 
 function _clearProfileDetail(){
   _currentProfileDetail = null;
+  _currentProfileChannelConfig = null;
   _profileMode = 'empty';
+  _stopProfileQrPolling();
   const title = $('profileDetailTitle');
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
@@ -2136,6 +2471,7 @@ async function activateCurrentProfile(){
 }
 
 async function deleteCurrentProfile(){
+  if (!_requireAdminUi()) return;
   if (!_currentProfileDetail) return;
   const name = _currentProfileDetail.name;
   const _ok = await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
@@ -2329,8 +2665,10 @@ async function switchToProfile(name) {
 }
 
 function openProfileCreate(){
+  if (!_requireAdminUi()) return;
   if (typeof switchPanel === 'function' && _currentPanel !== 'profiles') switchPanel('profiles');
   _profilePreFormDetail = _currentProfileDetail ? { ..._currentProfileDetail } : null;
+  _stopProfileQrPolling();
   _profileMode = 'create';
   _renderProfileForm();
 }
@@ -2355,6 +2693,12 @@ function _renderProfileForm(){
           </label>
         </div>
         <div class="detail-form-row">
+          <label class="detail-form-check" for="profileFormCloneSkills">
+            <input type="checkbox" id="profileFormCloneSkills" checked> <span>${esc(t('profile_clone_skills_label') || 'Also copy skills from active profile')}</span>
+          </label>
+          <div class="detail-form-hint">${esc(t('profile_clone_skills_hint') || 'Copies the skills/ directory only. Sessions, memories, logs, and cron data stay isolated.')}</div>
+        </div>
+        <div class="detail-form-row">
           <label for="profileFormBaseUrl">${esc(t('profile_base_url_label') || 'Base URL')}</label>
           <input type="text" id="profileFormBaseUrl" placeholder="${esc(t('profile_base_url_placeholder') || 'Optional, e.g. http://localhost:11434')}" autocomplete="off">
         </div>
@@ -2372,7 +2716,95 @@ function _renderProfileForm(){
   if (n) n.focus();
 }
 
+function _renderProfileFieldInput(platform, field, channel) {
+  const value = channel && channel.fields && channel.fields[field.key] != null ? String(channel.fields[field.key]) : '';
+  const id = `profileChannel-${platform}-${field.key}`;
+  if (field.type === 'select') {
+    const opts = (field.options || []).map(opt => `<option value="${esc(opt.value)}"${value===opt.value?' selected':''}>${esc(opt.label)}</option>`).join('');
+    return `<select id="${id}">${opts}</select>`;
+  }
+  return `<input type="${field.type || 'text'}" id="${id}" value="${field.secret ? '' : esc(value)}" placeholder="${esc(field.placeholder || '')}" autocomplete="off">`;
+}
+
+function _renderProfileChannelEditCard(platform) {
+  const spec = PROFILE_CHANNEL_FORM_SPECS[platform];
+  const channel = _profileChannelByPlatform(platform) || { enabled: false, configured: false, fields: {}, secrets: {} };
+  const enabledId = `profileChannelEnabled-${platform}`;
+  const qrBtn = spec.supportsQr ? `<button type="button" class="panel-head-btn" id="profileChannelQrBtn-${platform}" onclick="startProfileChannelQr('${platform}')" title="QR">扫码连接</button>` : '';
+  const note = spec.note ? `<div class="detail-form-hint">${esc(spec.note)}</div>` : '';
+  const fieldsHtml = spec.fields.map(field => {
+    const secretConfigured = field.secret && channel.secrets && channel.secrets[`${field.key}_configured`];
+    const hint = secretConfigured ? `<div class="detail-form-hint">已存在凭证，留空可保留当前值。</div>` : '';
+    return `<div class="detail-form-row">
+      <label for="profileChannel-${platform}-${field.key}">${esc(field.label)}</label>
+      ${_renderProfileFieldInput(platform, field, channel)}
+      ${hint}
+    </div>`;
+  }).join('');
+  return `<div class="detail-card">
+    <div class="detail-card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <span>${esc(spec.label)}</span>
+      <span style="display:flex;align-items:center;gap:8px">${qrBtn}</span>
+    </div>
+    <div class="detail-form-row">
+      <label class="detail-form-check" for="${enabledId}">
+        <input type="checkbox" id="${enabledId}" ${channel.enabled ? 'checked' : ''}>
+        <span>启用此通道</span>
+      </label>
+    </div>
+    ${note}
+    ${fieldsHtml}
+    <div id="profileChannelQrState-${platform}" class="detail-form-hint" style="display:none"></div>
+  </div>`;
+}
+
+function _renderProfileEditForm(){
+  const title = $('profileDetailTitle');
+  const body = $('profileDetailBody');
+  const empty = $('profileDetailEmpty');
+  if (!title || !body || !_currentProfileDetail) return;
+  title.textContent = `${t('edit') || 'Edit'} · ${_currentProfileDetail.name}`;
+  body.innerHTML = `
+    <div class="main-view-content">
+      <form class="detail-form" onsubmit="event.preventDefault(); saveProfileForm();">
+        <div class="detail-card">
+          <div class="detail-card-title">Profile</div>
+          <div class="detail-form-hint">通道配置按 profile 保存。普通用户只能修改自己可访问的 profile。</div>
+        </div>
+        ${Object.keys(PROFILE_CHANNEL_FORM_SPECS).map(_renderProfileChannelEditCard).join('')}
+        <div id="profileFormError" class="detail-form-error" style="display:none"></div>
+      </form>
+    </div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _profileMode = 'edit';
+  _setProfileHeaderButtons('edit');
+}
+
+function editCurrentProfile(){
+  if (!_currentProfileDetail) return;
+  _profilePreFormDetail = { ..._currentProfileDetail };
+  _stopProfileQrPolling();
+  _profileMode = 'edit';
+  if (_currentProfileChannelConfig && _currentProfileChannelConfig.name === _currentProfileDetail.name) {
+    _renderProfileEditForm();
+    return;
+  }
+  const title = $('profileDetailTitle');
+  const body = $('profileDetailBody');
+  const empty = $('profileDetailEmpty');
+  if (title) title.textContent = `${t('edit') || 'Edit'} · ${_currentProfileDetail.name}`;
+  if (body) {
+    body.innerHTML = `<div class="main-view-content"><div class="detail-card"><div class="detail-card-title">Channels</div><div style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div></div></div>`;
+    body.style.display = '';
+  }
+  if (empty) empty.style.display = 'none';
+  _setProfileHeaderButtons('edit');
+  _loadProfileChannels(_currentProfileDetail.name, { silent: false });
+}
+
 function cancelProfileForm(){
+  _stopProfileQrPolling();
   if (_profilePreFormDetail) {
     const snap = _profilePreFormDetail;
     _profilePreFormDetail = null;
@@ -2384,14 +2816,49 @@ function cancelProfileForm(){
 }
 
 async function saveProfileForm(){
+  if (_profileMode === 'edit') {
+    const errEl = $('profileFormError');
+    if (errEl) errEl.style.display = 'none';
+    if (!_currentProfileDetail) return;
+    try {
+      for (const [platform, spec] of Object.entries(PROFILE_CHANNEL_FORM_SPECS)) {
+        const enabledEl = $(`profileChannelEnabled-${platform}`);
+        const fields = { enabled: !!(enabledEl && enabledEl.checked) };
+        for (const field of spec.fields) {
+          const input = $(`profileChannel-${platform}-${field.key}`);
+          if (!input) continue;
+          fields[field.key] = ('value' in input ? input.value : '');
+        }
+        await api('/api/profile/channels/save', {
+          method: 'POST',
+          body: JSON.stringify({ name: _currentProfileDetail.name, platform, fields }),
+        });
+      }
+      showToast('通道配置已保存');
+      _currentProfileChannelConfig = null;
+      await loadProfilesPanel();
+      openProfileDetail(_currentProfileDetail.name);
+    } catch (e) {
+      if (errEl) {
+        errEl.textContent = e.message || (t('save_failed') || 'Save failed');
+        errEl.style.display = '';
+      } else {
+        showToast((t('save_failed') || 'Save failed: ') + e.message, 3000, 'error');
+      }
+    }
+    return;
+  }
+  if (!_requireAdminUi()) return;
   const nameEl = $('profileFormName');
   const cloneEl = $('profileFormClone');
+  const cloneSkillsEl = $('profileFormCloneSkills');
   const baseEl = $('profileFormBaseUrl');
   const apiKeyEl = $('profileFormApiKey');
   const errEl = $('profileFormError');
   if (!nameEl || !errEl) return;
   const name = (nameEl.value || '').trim().toLowerCase();
   const cloneConfig = !!(cloneEl && cloneEl.checked);
+  const cloneSkills = !!(cloneSkillsEl && cloneSkillsEl.checked && cloneConfig);
   errEl.style.display = 'none';
   if (!name) { errEl.textContent = t('name_required'); errEl.style.display = ''; return; }
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) { errEl.textContent = t('profile_name_rule'); errEl.style.display = ''; return; }
@@ -2400,6 +2867,7 @@ async function saveProfileForm(){
   if (baseUrl && !/^https?:\/\//.test(baseUrl)) { errEl.textContent = t('profile_base_url_rule'); errEl.style.display = ''; return; }
   try {
     const payload = { name, clone_config: cloneConfig };
+    if (cloneSkills) payload.clone_skills = true;
     if (baseUrl) payload.base_url = baseUrl;
     if (apiKey) payload.api_key = apiKey;
     await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
@@ -2413,12 +2881,80 @@ async function saveProfileForm(){
   }
 }
 
+function _renderProfileQrState(platform, payload) {
+  const box = $(`profileChannelQrState-${platform}`);
+  if (!box) return;
+  const status = payload && payload.status ? String(payload.status) : 'pending';
+  const qrImage = _profileQrImageUrl(payload);
+  const lines = [];
+  if (status === 'confirmed') lines.push('扫码完成，凭证已写入当前 profile。');
+  else if (status === 'scanned') lines.push('已扫码，请在手机端确认。');
+  else if (status === 'refreshed') lines.push('二维码已刷新，请重新扫码。');
+  else if (status === 'denied') lines.push('扫码已取消。');
+  else if (status === 'expired') lines.push('二维码已过期。');
+  else if (status === 'error') lines.push(payload.error || '扫码失败。');
+  else lines.push('请使用手机扫码。');
+  if (qrImage) lines.push(`<img src="${esc(qrImage)}" alt="QR" style="display:block;width:220px;height:220px;max-width:100%;margin-top:8px;border-radius:12px;background:#fff;padding:8px">`);
+  if (payload && payload.qr_url) lines.push(`<div style="margin-top:8px;word-break:break-all"><a href="${esc(payload.qr_url)}" target="_blank" rel="noreferrer">${esc(payload.qr_url)}</a></div>`);
+  box.innerHTML = lines.join('');
+  box.style.display = '';
+}
+
+function _scheduleProfileQrPoll(platform, delay = 2000) {
+  _stopProfileQrPolling(platform);
+  _profileQrPollTimers[platform] = setTimeout(() => pollProfileChannelQr(platform), delay);
+}
+
+async function startProfileChannelQr(platform) {
+  if (!_currentProfileDetail) return;
+  try {
+    const payload = await api('/api/profile/channels/qr/start', {
+      method: 'POST',
+      body: JSON.stringify({ name: _currentProfileDetail.name, platform }),
+    });
+    _profileQrSessions[platform] = payload.session_id;
+    _renderProfileQrState(platform, payload);
+    _scheduleProfileQrPoll(platform, 2000);
+  } catch (e) {
+    showToast((t('error_prefix') || 'Error: ') + e.message, 3000, 'error');
+  }
+}
+
+async function pollProfileChannelQr(platform) {
+  if (!_currentProfileDetail) return;
+  const sessionId = _profileQrSessions[platform];
+  if (!sessionId) return;
+  try {
+    const payload = await api('/api/profile/channels/qr/poll', {
+      method: 'POST',
+      body: JSON.stringify({ name: _currentProfileDetail.name, platform, session_id: sessionId }),
+    });
+    _renderProfileQrState(platform, payload);
+    if (payload.status === 'confirmed') {
+      _stopProfileQrPolling(platform);
+      showToast('扫码连接成功');
+      _currentProfileChannelConfig = null;
+      await _loadProfileChannels(_currentProfileDetail.name, { reRender: true, silent: true });
+      return;
+    }
+    if (payload.status === 'pending' || payload.status === 'scanned' || payload.status === 'refreshed') {
+      _scheduleProfileQrPoll(platform, payload.status === 'scanned' ? 1500 : 2500);
+      return;
+    }
+    _stopProfileQrPolling(platform);
+  } catch (e) {
+    _stopProfileQrPolling(platform);
+    showToast((t('error_prefix') || 'Error: ') + e.message, 3000, 'error');
+  }
+}
+
 // Back-compat
 const submitProfileCreate = saveProfileForm;
 function toggleProfileForm(){ openProfileCreate();
 }
 
 async function deleteProfile(name) {
+  if (!_requireAdminUi()) return;
   const _delProf=await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_delProf) return;
   try {
@@ -2496,7 +3032,8 @@ let _settingsPreferencesAutosaveTimer = null;
 let _settingsPreferencesAutosaveRetryPayload = null;
 
 function switchSettingsSection(name){
-  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='system')?name:'conversation';
+  const requested=(name==='appearance'||name==='preferences'||name==='providers'||name==='system')?name:'conversation';
+  const section=(!_isAdminUser() && (requested==='providers' || requested==='system')) ? 'conversation' : requested;
   _settingsSection=section;
   _currentSettingsSection=section;
   const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',system:'System'};
@@ -2602,6 +3139,7 @@ function _discardSettings(){
 
 // Mark settings as dirty whenever anything changes
 function _markSettingsDirty(){
+  if (_isRestrictedUser()) return;
   _settingsDirty = true;
 }
 
@@ -2966,10 +3504,28 @@ async function loadSettingsPanel(){
     // Show auth buttons only when auth is active
     try{
       const authStatus=await api('/api/auth/status');
+      window._authStatus=authStatus;
+      _settingsAuthStatus=authStatus;
       _setSettingsAuthButtonsVisible(!!authStatus.auth_enabled);
+      _applyAdminUiVisibility();
     }catch(e){}
+    try{
+      const profileData=await api('/api/profiles');
+      _settingsProfilesForUsers=(profileData.profiles||[]).map(p=>p.name);
+    }catch(e){
+      _settingsProfilesForUsers=['default'];
+    }
+    try{
+      const workspaceData=await api('/api/workspaces');
+      _settingsWorkspacesForUsers=(workspaceData.workspaces||[]).map(w=>({path:w.path,name:w.name||w.path}));
+    }catch(e){
+      _settingsWorkspacesForUsers=[];
+    }
+    _settingsAuthUsersOnOpen=Array.isArray(settings.auth_users)?settings.auth_users:[];
+    _renderAuthUsers(_settingsAuthUsersOnOpen);
     _syncHermesPanelSessionActions();
-    loadProvidersPanel(); // load provider cards in background
+    _applySettingsReadonlyState();
+    if (_isAdminUser()) loadProvidersPanel(); // load provider cards in background
     switchSettingsSection(_settingsSection);
   }catch(e){
     showToast(t('settings_load_failed')+e.message);
@@ -2979,8 +3535,19 @@ async function loadSettingsPanel(){
 // ── Providers panel ───────────────────────────────────────────────────────
 
 const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
+let _settingsAuthUsersOnOpen = [];
+let _settingsProfilesForUsers = [];
+let _settingsWorkspacesForUsers = [];
+let _settingsAuthStatus = null;
 
 async function loadProvidersPanel(){
+  if (!_isAdminUser()) {
+    const list=$('providersList');
+    const empty=$('providersEmpty');
+    if(list) list.innerHTML='';
+    if(empty) empty.style.display='none';
+    return;
+  }
   const list=$('providersList');
   const empty=$('providersEmpty');
   if(!list) return;
@@ -3150,6 +3717,7 @@ function _buildProviderCard(p){
 }
 
 async function _saveProviderKey(providerId){
+  if (!_requireAdminUi()) return;
   const els=_providerCardEls.get(providerId);
   if(!els) return;
   const key=els.input.value.trim();
@@ -3178,6 +3746,7 @@ async function _saveProviderKey(providerId){
 }
 
 async function _removeProviderKey(providerId){
+  if (!_requireAdminUi()) return;
   const els=_providerCardEls.get(providerId);
   if(!els) return;
   if(els.saveBtn){els.saveBtn.disabled=true;els.saveBtn.textContent=t('providers_removing');}
@@ -3218,8 +3787,159 @@ async function _refreshProviderModels(providerId, btn){
 function _setSettingsAuthButtonsVisible(active){
   const signOutBtn=$('btnSignOut');
   if(signOutBtn) signOutBtn.style.display=active?'':'none';
+  const signOutPrefsBtn=$('btnSignOutPreferences');
+  if(signOutPrefsBtn) signOutPrefsBtn.style.display=active?'':'none';
   const disableBtn=$('btnDisableAuth');
-  if(disableBtn) disableBtn.style.display=active?'':'none';
+  if(disableBtn) disableBtn.style.display=(active && _isAdminUser())?'':'none';
+  const usersWrap=$('settingsAuthUsersWrap');
+  if(usersWrap){
+    const canManage=!active || (_settingsAuthStatus&&_settingsAuthStatus.is_admin);
+    usersWrap.style.display=canManage?'':'none';
+  }
+}
+
+function _buildAuthUserCard(user={}){
+  const row=document.createElement('div');
+  row.className='auth-user-row';
+  row.style.cssText='border:1px solid var(--border2);border-radius:10px;padding:10px;background:var(--card-bg)';
+  const allowed=Array.isArray(user.allowed_profiles)&&user.allowed_profiles.length?user.allowed_profiles:[(_settingsProfilesForUsers[0]||'default')];
+  const currentDefault=allowed.includes(user.default_profile)?user.default_profile:(allowed[0]||'default');
+  const workspaceOptions=_settingsWorkspacesForUsers.length?_settingsWorkspacesForUsers:[];
+  const allowedWorkspaces=Array.isArray(user.allowed_workspaces)&&user.allowed_workspaces.length
+    ? [...new Set(user.allowed_workspaces.map(path=>String(path||'').trim()).filter(Boolean))]
+    : (workspaceOptions[0]?[workspaceOptions[0].path]:[]);
+  const currentDefaultWorkspace=allowedWorkspaces.includes(user.default_workspace)?user.default_workspace:(allowedWorkspaces[0]||'');
+  const profileOpts=(_settingsProfilesForUsers.length?_settingsProfilesForUsers:['default']).map(name=>{
+    const checked=allowed.includes(name)?'checked':'';
+    return `<label style="display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--border2);border-radius:999px;font-size:12px;cursor:pointer">
+      <input type="checkbox" class="auth-user-profile" value="${esc(name)}" ${checked}> <span>${esc(name)}</span>
+    </label>`;
+  }).join('');
+  const workspaceQuickOpts=workspaceOptions.map(item=>{
+    const disabled=allowedWorkspaces.includes(item.path)?'disabled':'';
+    return `<button type="button" class="sm-btn auth-user-workspace-preset" data-path="${esc(item.path)}" ${disabled} style="justify-content:flex-start;text-align:left;padding:6px 8px">
+      ${esc(item.name||item.path)}
+    </button>`;
+  }).join('');
+  row.innerHTML=`
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+      <strong style="font-size:12px">User</strong>
+      <button type="button" class="sm-btn auth-user-remove" style="padding:6px 10px">Remove</button>
+    </div>
+    <div style="display:grid;gap:8px">
+      <input type="text" class="auth-user-username" placeholder="username" value="${esc(user.username||'')}" autocomplete="off" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
+      <input type="password" class="auth-user-password" placeholder="${user.username?'Leave blank to keep password':'Set password'}" autocomplete="new-password" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
+      <div class="auth-user-profiles" style="display:flex;flex-wrap:wrap;gap:6px">${profileOpts}</div>
+      <select class="auth-user-default" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
+        ${allowed.map(name=>`<option value="${esc(name)}"${name===currentDefault?' selected':''}>Default profile: ${esc(name)}</option>`).join('')}
+      </select>
+      <div class="auth-user-workspaces" style="display:grid;gap:6px">
+        <div style="font-size:12px;color:var(--muted)">Allowed workspaces</div>
+        <div class="auth-user-workspace-selected" style="display:grid;gap:6px"></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="text" class="auth-user-workspace-path" placeholder="/absolute/path/to/workspace" autocomplete="off" style="flex:1;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
+          <button type="button" class="sm-btn auth-user-workspace-add" style="padding:8px 12px">Add</button>
+        </div>
+        <div class="auth-user-workspace-presets" style="display:flex;flex-wrap:wrap;gap:6px">${workspaceQuickOpts || `<div style="font-size:12px;color:var(--muted)">You can paste a workspace path directly.</div>`}</div>
+      </div>
+      <select class="auth-user-default-workspace" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:13px">
+      </select>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">
+        <input type="checkbox" class="auth-user-admin" ${user.is_admin?'checked':''}> <span>Administrator</span>
+      </label>
+    </div>`;
+  const syncDefaultProfiles=()=>{
+    const selected=[...row.querySelectorAll('.auth-user-profile:checked')].map(el=>el.value);
+    const normalized=selected.length?selected:[(_settingsProfilesForUsers[0]||'default')];
+    const select=row.querySelector('.auth-user-default');
+    const prev=select.value;
+    select.innerHTML=normalized.map(name=>`<option value="${esc(name)}">${name===prev?'Default profile: ':'Default profile: '}${esc(name)}</option>`).join('');
+    if(normalized.includes(prev)) select.value=prev;
+  };
+  const selectedBox=row.querySelector('.auth-user-workspace-selected');
+  const pathInput=row.querySelector('.auth-user-workspace-path');
+  const addBtn=row.querySelector('.auth-user-workspace-add');
+  const defaultWorkspaceSelect=row.querySelector('.auth-user-default-workspace');
+  const syncDefaultWorkspaces=()=>{
+    const normalized=[...row.querySelectorAll('.auth-user-workspace-value')].map(el=>el.value).filter(Boolean);
+    const presetButtons=[...row.querySelectorAll('.auth-user-workspace-preset')];
+    presetButtons.forEach(btn=>{ btn.disabled=normalized.includes(btn.dataset.path||''); });
+    if(selectedBox){
+      selectedBox.style.display=normalized.length?'grid':'none';
+    }
+    const select=row.querySelector('.auth-user-default-workspace');
+    const prev=select.value;
+    select.innerHTML=normalized.map(path=>{
+      const item=workspaceOptions.find(w=>w.path===path);
+      const label=item?(item.name||item.path):path;
+      return `<option value="${esc(path)}">Default workspace: ${esc(label)}</option>`;
+    }).join('');
+    select.disabled=!normalized.length;
+    if(normalized.includes(prev)) select.value=prev;
+    else if(normalized.length) select.value=normalized[0];
+  };
+  const addWorkspacePath=(path)=>{
+    const normalized=String(path||'').trim();
+    if(!normalized) return;
+    const existing=[...row.querySelectorAll('.auth-user-workspace-value')].map(el=>el.value);
+    if(existing.includes(normalized)) return;
+    const item=workspaceOptions.find(w=>w.path===normalized);
+    const entry=document.createElement('div');
+    entry.className='auth-user-workspace-entry';
+    entry.style.cssText='display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:6px 8px;border:1px solid var(--border2);border-radius:10px;font-size:12px';
+    entry.innerHTML=`<div style="min-width:0;display:grid;gap:2px"><strong style="font-size:12px">${esc(item?(item.name||item.path):(normalized.split('/').filter(Boolean).pop()||normalized))}</strong><div style="color:var(--muted);font-size:11px;word-break:break-all">${esc(normalized)}</div></div><button type="button" class="sm-btn auth-user-workspace-remove" style="padding:4px 8px">Remove</button><input type="hidden" class="auth-user-workspace-value" value="${esc(normalized)}">`;
+    entry.querySelector('.auth-user-workspace-remove').onclick=()=>{entry.remove();syncDefaultWorkspaces();_markSettingsDirty();};
+    selectedBox.appendChild(entry);
+    syncDefaultWorkspaces();
+    _markSettingsDirty();
+  };
+  row.querySelector('.auth-user-remove').onclick=()=>{row.remove();_markSettingsDirty();};
+  row.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',_markSettingsDirty,{once:false}));
+  row.querySelectorAll('.auth-user-profile').forEach(el=>el.addEventListener('change',()=>{syncDefaultProfiles();_markSettingsDirty();},{once:false}));
+  row.querySelectorAll('.auth-user-workspace-preset').forEach(btn=>btn.onclick=()=>addWorkspacePath(btn.dataset.path||''));
+  if(addBtn) addBtn.onclick=()=>{ addWorkspacePath((pathInput||{}).value||''); if(pathInput) pathInput.value=''; };
+  if(pathInput) pathInput.addEventListener('keydown',(e)=>{
+    if(e.key==='Enter'){ e.preventDefault(); addWorkspacePath(pathInput.value||''); pathInput.value=''; }
+  });
+  allowedWorkspaces.forEach(addWorkspacePath);
+  syncDefaultWorkspaces();
+  return row;
+}
+
+function _renderAuthUsers(users=[]){
+  const box=$('settingsAuthUsers');
+  if(!box) return;
+  box.innerHTML='';
+  for(const user of users){
+    box.appendChild(_buildAuthUserCard(user));
+  }
+}
+
+function addAuthUserRow(){
+  const box=$('settingsAuthUsers');
+  if(!box) return;
+  box.appendChild(_buildAuthUserCard({}));
+  _markSettingsDirty();
+}
+
+function _collectAuthUsers(){
+  return [...document.querySelectorAll('.auth-user-row')].map(row=>{
+    const username=(row.querySelector('.auth-user-username')||{}).value||'';
+    const password=(row.querySelector('.auth-user-password')||{}).value||'';
+    const allowedProfiles=[...row.querySelectorAll('.auth-user-profile:checked')].map(el=>el.value);
+    const defaultProfile=((row.querySelector('.auth-user-default')||{}).value)||allowedProfiles[0]||'default';
+    const allowedWorkspaces=[...row.querySelectorAll('.auth-user-workspace-value')].map(el=>el.value).filter(Boolean);
+    const defaultWorkspace=((row.querySelector('.auth-user-default-workspace')||{}).value)||allowedWorkspaces[0]||'';
+    return {
+      username:username.trim().toLowerCase(),
+      password:password.trim(),
+      allowed_profiles:allowedProfiles,
+      default_profile:defaultProfile,
+      allowed_workspaces:allowedWorkspaces,
+      default_workspace:defaultWorkspace,
+      is_admin:!!((row.querySelector('.auth-user-admin')||{}).checked),
+    };
+  }).filter(user=>user.username);
 }
 
 function _applySavedSettingsUi(saved, body, opts){
@@ -3240,6 +3960,10 @@ function _applySavedSettingsUi(saved, body, opts){
   if(typeof startGatewaySSE==='function'){
     if(showCliSessions) startGatewaySSE();
     else if(typeof stopGatewaySSE==='function') stopGatewaySSE();
+  }
+  if(Array.isArray(saved.auth_users)){
+    _settingsAuthUsersOnOpen=saved.auth_users;
+    _renderAuthUsers(saved.auth_users);
   }
   _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
   _settingsDirty=false;
@@ -3304,6 +4028,10 @@ async function checkUpdatesNow(){
 }
 
 async function saveSettings(andClose){
+  if (!_isAdminUser()) {
+    showToast('Only administrators can save instance settings', 3000, 'error');
+    return;
+  }
   const model=($('settingsModel')||{}).value;
   const modelChanged=(model||'')!==(_settingsHermesDefaultModelOnOpen||'');
   const sendKey=($('settingsSendKey')||{}).value;
@@ -3336,6 +4064,10 @@ async function saveSettings(andClose){
   body.auto_title_refresh_every=(($('settingsAutoTitleRefresh')||{}).value||'0');
   const botName=(($('settingsBotName')||{}).value||'').trim();
   body.bot_name=botName||'Hermes';
+  const authUsersWrap=$('settingsAuthUsersWrap');
+  if(authUsersWrap && authUsersWrap.style.display!=='none'){
+    body.auth_users=_collectAuthUsers();
+  }
   // Password: only act if the field has content; blank = leave auth unchanged
   if(pw && pw.trim()){
     try{
@@ -3388,6 +4120,7 @@ async function signOut(){
 }
 
 async function disableAuth(){
+  if (!_requireAdminUi()) return;
   const _disAuth=await showConfirmDialog({title:t('disable_auth_confirm_title'),message:t('disable_auth_confirm_message'),confirmLabel:t('disable'),danger:true,focusCancel:true});
   if(!_disAuth) return;
   try{
@@ -3398,6 +4131,8 @@ async function disableAuth(){
     if(disableBtn) disableBtn.style.display='none';
     const signOutBtn=$('btnSignOut');
     if(signOutBtn) signOutBtn.style.display='none';
+    const signOutPrefsBtn=$('btnSignOutPreferences');
+    if(signOutPrefsBtn) signOutPrefsBtn.style.display='none';
   }catch(e){
     showToast(t('disable_auth_failed')+e.message);
   }
